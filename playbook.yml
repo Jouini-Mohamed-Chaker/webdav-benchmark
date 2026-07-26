@@ -4,6 +4,10 @@
   become: yes
   vars:
     numa_subnet_prefix: "192.168.95"
+    # Combined queue count to request - matches Proxmox-side Multiqueue setting.
+    # All three VMs (client/proxy/webdav) are now 32 vCPU / 4 sockets with
+    # Multiqueue=32 set in Proxmox, so the guest side needs to match.
+    target_queues: 32
   tasks:
     - name: Install Nginx, Firewalld, SELinux, numactl, sysstat
       dnf:
@@ -52,6 +56,44 @@
     # pinning needed/possible here, so that step has been removed.
 
     # -----------------------------------------------------------
+    # Multiqueue: Proxmox-side Multiqueue=32 only raises the ceiling -
+    # the guest still has to actually turn the queues on, and a plain
+    # `ethtool -L` doesn't survive a reboot. RHEL hosts are on
+    # NetworkManager, so we persist it into the connection profile
+    # (nmcli), which re-applies ethtool.channels-combined on every
+    # activation instead of relying on a one-shot command.
+    # -----------------------------------------------------------
+    - name: Get active NetworkManager connection name for NUMA interface
+      command: nmcli -t -f NAME,DEVICE connection show --active
+      register: nm_connections
+      changed_when: false
+      when: numa_iface is defined
+
+    - name: Identify NM connection name bound to the NUMA interface
+      set_fact:
+        numa_nm_conn: "{{ item.split(':')[0] }}"
+      loop: "{{ nm_connections.stdout_lines }}"
+      when:
+        - numa_iface is defined
+        - nm_connections.stdout_lines is defined
+        - item.endswith(':' + numa_iface)
+
+    - name: Check current combined channel count
+      command: ethtool -l {{ numa_iface }}
+      register: ethtool_channels_current
+      changed_when: false
+      when: numa_iface is defined
+
+    - name: Set combined queue count persistently via NetworkManager profile
+      command: >
+        nmcli connection modify "{{ numa_nm_conn }}"
+        ethtool.channels-combined {{ target_queues }}
+      when:
+        - numa_iface is defined
+        - numa_nm_conn is defined
+      notify: Reactivate NUMA NIC connection
+
+    # -----------------------------------------------------------
     # sysctl + ulimit tuning (network + fd limits for high-concurrency)
     # -----------------------------------------------------------
     - name: Deploy sysctl tuning
@@ -98,6 +140,9 @@
       when: "'webdav_backend' in group_names or 'nginx_proxy' in group_names"
 
   handlers:
+    - name: Reactivate NUMA NIC connection
+      command: nmcli connection up "{{ numa_nm_conn }}"
+
     - name: Reload sysctl
       command: sysctl --system
 
@@ -262,6 +307,62 @@
         daemon_reload: yes
         state: restarted
         enabled: yes
+
+# -----------------------------------------------------------
+# Configure NIC multiqueue on the Ubuntu client (control node)
+#
+# Ubuntu 24's netplan has no ethtool.channels-combined equivalent to
+# NetworkManager's, so persistence here is a systemd oneshot unit tied
+# to the NIC device via BindsTo, instead of a one-off `ethtool -L` that
+# would silently revert on next boot/NIC reinit.
+# -----------------------------------------------------------
+- name: Configure NUMA-net NIC multiqueue on Ubuntu client
+  hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    numa_subnet_prefix: "192.168.95"
+    target_queues: 32
+  tasks:
+    - name: Detect NUMA-net interface from facts
+      set_fact:
+        numa_iface: "{{ item }}"
+      loop: "{{ ansible_facts.interfaces }}"
+      when:
+        - numa_iface is not defined
+        - ansible_facts[item].ipv4 is defined
+        - ansible_facts[item].ipv4.address is defined
+        - ansible_facts[item].ipv4.address.split('.')[0:3] | join('.') == numa_subnet_prefix
+
+    - name: Show detected NUMA interface on client
+      debug:
+        msg: "NUMA-net interface on client is {{ numa_iface | default('NOT FOUND') }}"
+
+    - name: Check current combined channel count on client
+      command: ethtool -l {{ numa_iface }}
+      register: ethtool_channels_current
+      changed_when: false
+      when: numa_iface is defined
+
+    - name: Deploy systemd unit to set multiqueue on NIC bring-up
+      template:
+        src: templates/nic-multiqueue.service.j2
+        dest: /etc/systemd/system/nic-multiqueue@.service
+      when: numa_iface is defined
+      notify: Reload systemd on client
+
+    - name: Enable and start multiqueue unit for detected interface
+      systemd:
+        name: "nic-multiqueue@{{ numa_iface }}.service"
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      when: numa_iface is defined
+
+  handlers:
+    - name: Reload systemd on client
+      systemd:
+        daemon_reload: yes
 
 # -----------------------------------------------------------
 # Run the benchmark from the Ansible control node (Ubuntu client)

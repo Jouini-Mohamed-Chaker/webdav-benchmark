@@ -1,0 +1,23 @@
+# Managed by Ansible - webdav bench
+#
+# Persistently sets combined RX/TX queue count on a virtio NIC to match
+# the Proxmox-side Multiqueue setting ({{ target_queues }}) and the VM's
+# vCPU count. A plain `ethtool -L` doesn't survive a reboot or NIC
+# reinit; binding to the device unit re-applies this every time the
+# interface comes up.
+#
+# Instantiated as nic-multiqueue@<iface>.service
+
+[Unit]
+Description=Set combined multiqueue channels on %i
+After=sys-subsystem-net-devices-%i.device
+BindsTo=sys-subsystem-net-devices-%i.device
+Before=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/ethtool -L %i combined {{ target_queues }}
+
+[Install]
+WantedBy=multi-user.target
