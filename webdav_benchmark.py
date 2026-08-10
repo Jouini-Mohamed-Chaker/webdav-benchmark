@@ -15,7 +15,7 @@ Usage:
 import argparse, os, shutil, signal, statistics, subprocess, sys, tempfile, time, threading
 from concurrent.futures import ThreadPoolExecutor
 
-LEVELS_DEFAULT = [2, 4, 8, 16, 32, 48, 64, 96, 128]
+LEVELS_DEFAULT = [2, 4, 8, 16, 32, 48, 64]
 
 def die(msg):
     sys.exit(f"ERROR: {msg}")
