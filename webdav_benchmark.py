@@ -91,8 +91,10 @@ def sweep(transport, direction, src_file, size_mb, levels, repeats, tag):
                     results_raw = [f.result() for f in futures]
                 elapsed = time.time() - start
                 
-                for nm in names:
-                    transport.delete(nm)
+                # FIX: Only attempt to delete files that successfully uploaded
+                for nm, res in zip(names, results_raw):
+                    if res[0]: # res[0] is the boolean success flag
+                        transport.delete(nm)
             else:
                 remote_src = f"{tag}_download_src"
                 dst_dir = tempfile.mkdtemp(prefix="webdav_bench_dl_")
