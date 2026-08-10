@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-WebDAV Throughput Benchmark - curl or rclone transport, one sweep engine.
+WebDAV Throughput Benchmark - curl (N processes) or rclone (native N-way
+concurrency via --transfers/--checkers in a single process) transport.
 
 Usage:
   ./webdav_bench.py curl   <server-ip> [--port 8080] [--size 200] [--repeats 3]
   ./webdav_bench.py rclone <remote-name> [--size 200] [--repeats 3]
 
-  --levels "2 4 8 16 32 64"   override parallel stream counts (default: 2 4 8 16 32 48 64 96 128)
+  --levels "2 4 8 16 32 64"   override concurrency levels (default: 2 4 8 16 32 48 64 96 128)
+                              curl: N separate processes. rclone: N via --transfers/--checkers
+                              in one process.
   --budget 8192               tmpfs safety budget in MB (default 8192, leaves headroom under a 12g tmpfs)
 """
 import argparse, os, shutil, statistics, subprocess, sys, tempfile, time, threading
@@ -21,6 +24,11 @@ def run(cmd):
     """Run a command. Returns (success, stderr_text)."""
     r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     return r.returncode == 0, r.stderr.strip()
+
+def run_capture(cmd):
+    """Run a command, capturing stdout. Returns (success, stdout_text, stderr_text)."""
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return r.returncode == 0, r.stdout, r.stderr.strip()
 
 class Curl:
     name = "curl"
@@ -41,6 +49,14 @@ class Curl:
             print(f"\n  [Warning] Curl delete failed for {remote_name}: {err}")
 
 class Rclone:
+    """
+    Native-concurrency rclone transport: at concurrency level N, this runs a
+    SINGLE `rclone copy` process with --transfers N --checkers N against a
+    directory of N files, instead of spawning N separate rclone processes.
+    This measures rclone's own internal parallel-transfer efficiency
+    (connection reuse, scheduler, etc.) - the way rclone is actually used in
+    practice - rather than N independent short-lived client processes.
+    """
     name = "rclone"
     def __init__(self, remote):
         self.remote = remote
@@ -50,18 +66,32 @@ class Rclone:
         ok, err = run(["rclone", "lsd", f"{self.remote}:"])
         if not ok:
             die(f"Can't reach remote '{self.remote}': {err}")
-    def upload(self, src_file, remote_name):
-        return run(["rclone", "copyto", src_file, f"{self.remote}:{remote_name}",
+
+    def copy_to_remote(self, local_dir, remote_dir, n):
+        """One rclone process, N-way internal concurrency, uploads everything in local_dir."""
+        return run(["rclone", "copy", local_dir, f"{self.remote}:{remote_dir}",
+                    "--transfers", str(n), "--checkers", str(n),
                     "--no-check-dest", "--low-level-retries", "1", "--retries", "1",
                     "--contimeout", "30s", "--timeout", "600s", "--stats=0"])
-    def download(self, remote_name, dst_file):
-        return run(["rclone", "copyto", f"{self.remote}:{remote_name}", dst_file,
+
+    def copy_from_remote(self, remote_dir, local_dir, n):
+        """One rclone process, N-way internal concurrency, downloads everything in remote_dir."""
+        return run(["rclone", "copy", f"{self.remote}:{remote_dir}", local_dir,
+                    "--transfers", str(n), "--checkers", str(n),
                     "--low-level-retries", "1", "--retries", "1",
                     "--contimeout", "30s", "--timeout", "600s", "--stats=0"])
-    def delete(self, remote_name):
-        ok, err = run(["rclone", "deletefile", f"{self.remote}:{remote_name}"])
+
+    def count_remote(self, remote_dir):
+        """How many files actually landed in remote_dir (post-transfer success count)."""
+        ok, out, _ = run_capture(["rclone", "lsf", f"{self.remote}:{remote_dir}"])
         if not ok:
-            print(f"\n  [Warning] Rclone delete failed for {remote_name}: {err}")
+            return 0
+        return len([l for l in out.splitlines() if l.strip()])
+
+    def purge(self, remote_dir):
+        ok, err = run(["rclone", "purge", f"{self.remote}:{remote_dir}"])
+        if not ok and "directory not found" not in err.lower():
+            print(f"\n  [Warning] Rclone purge failed for {remote_dir}: {err}")
 
 def gbit(total_bytes, secs):
     return round((total_bytes * 8) / secs / 1_000_000_000, 3) if secs > 0 else 0.0
@@ -131,6 +161,74 @@ def sweep(transport, direction, src_file, size_mb, levels, repeats, tag):
             sample_error[0] = None
     return results
 
+def sweep_rclone_native(transport, direction, src_file, size_mb, levels, repeats, tag):
+    """
+    Native-concurrency sweep for rclone: one `rclone copy` process per run,
+    using --transfers N --checkers N, instead of N separate processes.
+    direction: 'upload' or 'download'. Returns {N: median_gbit}.
+    """
+    results = {}
+    for n in levels:
+        run_gbits, fails = [], 0
+        sample_error = [None]
+
+        # For downloads, pre-seed a remote dir with N files ONCE per level
+        # (unmeasured) so each timed repeat downloads the same N-file set.
+        seed_remote_dir = None
+        if direction == "download":
+            seed_remote_dir = f"{tag}_dlsrc_{n}"
+            seed_dir = tempfile.mkdtemp(prefix="webdav_bench_seed_")
+            for i in range(n):
+                os.link(src_file, os.path.join(seed_dir, f"s{i}"))
+            ok, err = transport.copy_to_remote(seed_dir, seed_remote_dir, n)
+            shutil.rmtree(seed_dir, ignore_errors=True)
+            if not ok or transport.count_remote(seed_remote_dir) < n:
+                transport.purge(seed_remote_dir)
+                die(f"Seeding {n} files for download sweep failed: {err}")
+
+        for r in range(1, repeats + 1):
+            print(f"\r{direction}: {n} transfers (native), run {r}/{repeats}...".ljust(60), end="", flush=True)
+
+            if direction == "upload":
+                batch_dir = tempfile.mkdtemp(prefix="webdav_bench_up_")
+                for i in range(n):
+                    os.link(src_file, os.path.join(batch_dir, f"u{i}"))
+                remote_dir = f"{tag}_up_{n}_{r}"
+
+                start = time.time()
+                ok, err = transport.copy_to_remote(batch_dir, remote_dir, n)
+                elapsed = time.time() - start
+
+                success = transport.count_remote(remote_dir)
+                transport.purge(remote_dir)
+                shutil.rmtree(batch_dir, ignore_errors=True)
+            else:
+                dst_dir = tempfile.mkdtemp(prefix="webdav_bench_dn_")
+
+                start = time.time()
+                ok, err = transport.copy_from_remote(seed_remote_dir, dst_dir, n)
+                elapsed = time.time() - start
+
+                success = len(os.listdir(dst_dir))
+                shutil.rmtree(dst_dir, ignore_errors=True)
+
+            fails += (n - success)
+            if not ok and err and sample_error[0] is None:
+                sample_error[0] = err
+
+            run_gbits.append(gbit(success * size_mb * 1_048_576, elapsed))
+
+        if seed_remote_dir:
+            transport.purge(seed_remote_dir)
+
+        med = statistics.median(run_gbits)
+        results[n] = med
+        status = f"[{fails} total failures across {repeats} runs]" if fails else "[0 failures]"
+        print(f"\r{direction.capitalize():10s} ({n:3d} transfers): {med:8.3f} Gbit/s (median)  {status}".ljust(70))
+        if fails and sample_error[0]:
+            print(f"           sample error: {sample_error[0][:200]}")
+    return results
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("mode", choices=["curl", "rclone"])
@@ -165,15 +263,24 @@ def main():
 
     tag = f"bench_{os.getpid()}"
 
-    print(f"\n=== UPLOAD SWEEP ({transport.name}, median of {args.repeats} runs) ===")
-    up_results = sweep(transport, "upload", src_file, size_mb, levels, args.repeats, tag)
+    if args.mode == "rclone":
+        # Native concurrency: one rclone process per run, --transfers N/--checkers N.
+        print(f"\n=== UPLOAD SWEEP ({transport.name} native, median of {args.repeats} runs) ===")
+        up_results = sweep_rclone_native(transport, "upload", src_file, size_mb, levels, args.repeats, tag)
 
-    print(f"\n=== DOWNLOAD SWEEP ({transport.name}, median of {args.repeats} runs) ===")
-    seed_ok, seed_err = transport.upload(src_file, f"{tag}_download_src")
-    if not seed_ok:
-        die(f"Seed upload for download sweep failed: {seed_err}")
-    down_results = sweep(transport, "download", src_file, size_mb, levels, args.repeats, tag)
-    transport.delete(f"{tag}_download_src")
+        print(f"\n=== DOWNLOAD SWEEP ({transport.name} native, median of {args.repeats} runs) ===")
+        down_results = sweep_rclone_native(transport, "download", src_file, size_mb, levels, args.repeats, tag)
+    else:
+        # curl: N separate processes (curl has no built-in multi-transfer concurrency).
+        print(f"\n=== UPLOAD SWEEP ({transport.name}, median of {args.repeats} runs) ===")
+        up_results = sweep(transport, "upload", src_file, size_mb, levels, args.repeats, tag)
+
+        print(f"\n=== DOWNLOAD SWEEP ({transport.name}, median of {args.repeats} runs) ===")
+        seed_ok, seed_err = transport.upload(src_file, f"{tag}_download_src")
+        if not seed_ok:
+            die(f"Seed upload for download sweep failed: {seed_err}")
+        down_results = sweep(transport, "download", src_file, size_mb, levels, args.repeats, tag)
+        transport.delete(f"{tag}_download_src")
 
     shutil.rmtree(tmpdir, ignore_errors=True)
 
