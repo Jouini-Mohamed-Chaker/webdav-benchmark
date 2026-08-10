@@ -201,6 +201,22 @@
     webdav_tmpfs_size: 12g
     webdav_serve_path: "{{ webdav_tmpfs_mount if use_tmpfs else webdav_disk_mount }}"
   tasks:
+    # --- Remove nginx from this box - it used to serve WebDAV here but
+    # httpd/mod_dav has replaced it. Must be stopped before httpd can
+    # bind port 8080, and left running would just be a stale, unmanaged
+    # process holding the port on every future run.
+    - name: Stop and disable nginx if present (superseded by httpd here)
+      systemd:
+        name: nginx
+        state: stopped
+        enabled: no
+      failed_when: false
+
+    - name: Remove nginx package from webdav backend
+      dnf:
+        name: nginx
+        state: absent
+
     # --- Real disk, kept mounted/persisted for later non-benchmark use ---
     - name: Get UUID of the webdav disk
       command: blkid -s UUID -o value {{ webdav_disk }}
