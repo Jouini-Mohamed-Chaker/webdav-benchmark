@@ -1,25 +1,32 @@
-server {
-    listen 8080 default_server;
-    server_name _;
+# Apache mod_dav WebDAV vhost - listens on 8080, same path/behavior as the
+# old nginx dav_module setup but with full WebDAV method support
+# (PROPFIND/OPTIONS included natively - no extra modules needed).
 
-    client_max_body_size 0;
-    client_body_buffer_size 16M;
-    client_body_temp_path {{ webdav_serve_path }}/.uploadtmp 1 2;
+Listen 8080
 
-    aio threads=default;
-    output_buffers 2 1m;
+<VirtualHost *:8080>
+    ServerName webdav-backend
 
-    keepalive_timeout 65s;
-    keepalive_requests 100000;
-    reset_timedout_connection on;
+    Alias /dav {{ webdav_serve_path }}
 
-    location /dav {
-        alias {{ webdav_serve_path }};
+    <Directory "{{ webdav_serve_path }}">
+        DAV On
+        Options None
+        AllowOverride None
+        Require all granted
 
-        dav_methods PUT DELETE MKCOL COPY MOVE;
-        create_full_put_path on;
-        dav_access user:rw group:rw all:rw;
+        # Match previous dav_access user:rw group:rw all:rw intent
+        <IfModule mod_headers.c>
+            Header set X-WebDAV-Backend "apache-mod_dav"
+        </IfModule>
+    </Directory>
 
-        autoindex on;
-    }
-}
+    # Keep uploads landing in the same tmp dir/filesystem as before
+    # (mod_dav writes directly to the target path; DAVLockDB just needs
+    # a writable location for lock state).
+    DAVLockDB /var/lib/dav/lockdb
+
+    LogLevel warn
+    ErrorLog /var/log/httpd/webdav_error.log
+    CustomLog /var/log/httpd/webdav_access.log combined
+</VirtualHost>

@@ -9,15 +9,28 @@
     # Multiqueue=32 set in Proxmox, so the guest side needs to match.
     target_queues: 32
   tasks:
-    - name: Install Nginx, Firewalld, SELinux, numactl, sysstat
+    - name: Install common packages (Firewalld, SELinux, numactl, sysstat)
       dnf:
         name:
-          - nginx
           - firewalld
           - policycoreutils-python-utils
           - numactl
           - sysstat
         state: present
+
+    - name: Install Nginx (proxy role only)
+      dnf:
+        name: nginx
+        state: present
+      when: "'nginx_proxy' in group_names"
+
+    - name: Install Apache httpd + mod_dav (webdav backend only)
+      dnf:
+        name:
+          - httpd
+          - mod_dav
+        state: present
+      when: "'webdav_backend' in group_names"
 
     - name: Ensure Firewalld is running
       systemd:
@@ -111,6 +124,8 @@
           root hard nofile 1048576
           nginx soft nofile 1048576
           nginx hard nofile 1048576
+          apache soft nofile 1048576
+          apache hard nofile 1048576
           * soft nofile 1048576
           * hard nofile 1048576
 
@@ -119,25 +134,40 @@
         path: /etc/systemd/system/nginx.service.d
         state: directory
         mode: '0755'
-      when: "'webdav_backend' in group_names or 'nginx_proxy' in group_names"
+      when: "'nginx_proxy' in group_names"
 
     - name: Deploy nginx systemd limit override
       template:
         src: templates/nginx_limits_override.conf.j2
         dest: /etc/systemd/system/nginx.service.d/limits.conf
       notify: Reload systemd
-      when: "'webdav_backend' in group_names or 'nginx_proxy' in group_names"
+      when: "'nginx_proxy' in group_names"
+
+    - name: Create systemd override dir for httpd
+      file:
+        path: /etc/systemd/system/httpd.service.d
+        state: directory
+        mode: '0755'
+      when: "'webdav_backend' in group_names"
+
+    - name: Deploy httpd systemd limit override
+      template:
+        src: templates/nginx_limits_override.conf.j2
+        dest: /etc/systemd/system/httpd.service.d/limits.conf
+      notify: Reload systemd
+      when: "'webdav_backend' in group_names"
 
     # -----------------------------------------------------------
     # nginx.conf is fully managed here - single source of truth,
     # safe to re-run (template is idempotent: no-op if unchanged)
+    # Proxy only now - the backend runs httpd, not nginx.
     # -----------------------------------------------------------
     - name: Deploy managed nginx.conf
       template:
         src: templates/nginx.conf.j2
         dest: /etc/nginx/nginx.conf
       notify: Restart Nginx
-      when: "'webdav_backend' in group_names or 'nginx_proxy' in group_names"
+      when: "'nginx_proxy' in group_names"
 
   handlers:
     - name: Reactivate NUMA NIC connection
@@ -181,8 +211,8 @@
       file:
         path: "{{ webdav_disk_mount }}"
         state: directory
-        owner: nginx
-        group: nginx
+        owner: apache
+        group: apache
         mode: '0775'
 
     - name: Persist xfs mount in fstab (by UUID) and mount now
@@ -216,8 +246,8 @@
       file:
         path: "{{ webdav_tmpfs_mount }}"
         state: directory
-        owner: nginx
-        group: nginx
+        owner: apache
+        group: apache
         mode: '0775'
       when: use_tmpfs
 
@@ -226,7 +256,7 @@
         path: "{{ webdav_tmpfs_mount }}"
         src: tmpfs
         fstype: tmpfs
-        opts: "size={{ webdav_tmpfs_size }},uid=nginx,gid=nginx,mode=0775"
+        opts: "size={{ webdav_tmpfs_size }},uid=apache,gid=apache,mode=0775"
         state: mounted
       when: use_tmpfs
 
@@ -247,30 +277,44 @@
       file:
         path: "{{ webdav_serve_path }}/.uploadtmp"
         state: directory
-        owner: nginx
-        group: nginx
+        owner: apache
+        group: apache
         mode: '0775'
 
     - name: Apply SELinux context to serve + tmp paths
       command: restorecon -R {{ webdav_serve_path }}
       changed_when: false
 
-    - name: Deploy WebDAV Nginx configuration
+    - name: Ensure DAV lock db directory exists
+      file:
+        path: /var/lib/dav
+        state: directory
+        owner: apache
+        group: apache
+        mode: '0770'
+
+    - name: Allow httpd to write to filesystem (SELinux boolean for DAV writes)
+      seboolean:
+        name: httpd_unified
+        state: yes
+        persistent: yes
+
+    - name: Deploy Apache WebDAV vhost configuration
       template:
         src: templates/webdav.conf.j2
-        dest: /etc/nginx/conf.d/webdav.conf
-      notify: Restart Nginx
+        dest: /etc/httpd/conf.d/webdav.conf
+      notify: Restart httpd
 
-    - name: Ensure default server configuration is removed
+    - name: Ensure default httpd welcome page config is disabled
       file:
-        path: /etc/nginx/conf.d/default.conf
+        path: /etc/httpd/conf.d/welcome.conf
         state: absent
-      notify: Restart Nginx
+      notify: Restart httpd
 
   handlers:
-    - name: Restart Nginx
+    - name: Restart httpd
       systemd:
-        name: nginx
+        name: httpd
         daemon_reload: yes
         state: restarted
         enabled: yes
@@ -365,43 +409,15 @@
         daemon_reload: yes
 
 # -----------------------------------------------------------
-# Run the benchmark from the Ansible control node (Ubuntu client)
+# Benchmarking is NOT run through Ansible anymore.
+# This playbook only provisions the environment (packages, NIC/sysctl
+# tuning, nginx proxy, apache/mod_dav backend). Once a run completes,
+# benchmark manually from the Ubuntu client with:
+#
+#   ./benchmark.sh <proxy-ip> 8080 <file_size_mb> <parallel_file_mb> <repeats>
+#   ./rclone_benchmark.sh webdav_proxy <file_size_mb> <repeats>
+#   ./rclone_benchmark.sh webdav_direct <file_size_mb> <repeats>   # bypass proxy
+#
+# This keeps iteration fast (no full playbook run needed per test) and
+# keeps the provisioning code idempotent/safe to re-run independently.
 # -----------------------------------------------------------
-- name: Run WebDAV benchmark from client
-  hosts: localhost
-  connection: local
-  become: no
-  vars:
-    proxy_ip: "{{ hostvars[groups['nginx_proxy'][0]]['inventory_hostname'] }}"
-    numa_node_client: "{{ numa_node_client | default('0') }}"
-    file_size_mb: "{{ file_size_mb | default(1000) }}"
-    parallel_file_mb: "{{ parallel_file_mb | default(200) }}"
-    repeats: "{{ repeats | default(3) }}"
-  tasks:
-    - name: Ensure benchmark.sh is executable
-      file:
-        path: "{{ playbook_dir }}/benchmark.sh"
-        mode: '0755'
-
-    - name: Clear stale files from a previous run's tmpfs (server-side)
-      command: >
-        ssh -o StrictHostKeyChecking=no
-        {{ hostvars[groups['webdav_backend'][0]]['ansible_user'] }}@{{ hostvars[groups['webdav_backend'][0]]['inventory_hostname'] }}
-        "find /mnt/webdav_ram -mindepth 1 -not -path '*/.uploadtmp*' -delete"
-      changed_when: false
-
-    - name: Run benchmark.sh against the proxy (with raised ulimit applied)
-      shell: >
-        ulimit -n 1048576 &&
-        {{ playbook_dir }}/benchmark.sh {{ proxy_ip }} 8080
-        {{ file_size_mb }} {{ parallel_file_mb }} {{ repeats }}
-      environment:
-        NUMA_NODE: "{{ numa_node_client }}"
-        MAX_TIME_SECONDS: "{{ max_time_seconds | default(15) }}"
-        PARALLEL_LEVELS_OVERRIDE: "{{ parallel_levels_override | default('2 4 8 16 32 48 64 96 128') }}"
-      register: bench_out
-      changed_when: false
-
-    - name: Show benchmark output
-      debug:
-        var: bench_out.stdout_lines
