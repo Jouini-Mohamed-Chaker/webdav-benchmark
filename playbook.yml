@@ -217,6 +217,18 @@
         name: nginx
         state: absent
 
+    - name: Clear any stale failed state on httpd unit
+      command: systemctl reset-failed httpd
+      changed_when: false
+      failed_when: false
+
+    - name: Ensure SELinux allows httpd to bind port 8080
+      seport:
+        ports: 8080
+        proto: tcp
+        setype: http_port_t
+        state: present
+
     # --- Real disk, kept mounted/persisted for later non-benchmark use ---
     - name: Get UUID of the webdav disk
       command: blkid -s UUID -o value {{ webdav_disk }}
@@ -326,6 +338,17 @@
         path: /etc/httpd/conf.d/welcome.conf
         state: absent
       notify: Restart httpd
+
+    # Explicit, unconditional check - the template/handler above only fires
+    # on config *changes*, so on a re-run with no config diff (e.g. right
+    # after removing nginx) httpd could otherwise stay in a stale failed
+    # state indefinitely. This guarantees it's actually up every run.
+    - name: Ensure httpd is actually running
+      systemd:
+        name: httpd
+        state: started
+        enabled: yes
+        daemon_reload: yes
 
   handlers:
     - name: Restart httpd
