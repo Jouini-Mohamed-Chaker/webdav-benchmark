@@ -1,0 +1,14 @@
+# Managed by Ansible - explicit MPM event tuning for the WebDAV backend.
+# RHEL's stock httpd defaults are conservative for a benchmarking workload
+# with 100+ concurrent connections; this makes the actual limits explicit
+# and adjustable instead of relying on whatever ships in the RPM.
+<IfModule mpm_event_module>
+    ServerLimit           {{ httpd_server_limit }}
+    ThreadsPerChild       {{ httpd_threads_per_child }}
+    ThreadLimit           {{ httpd_threads_per_child }}
+    StartServers          2
+    MinSpareThreads       {{ httpd_min_spare_threads }}
+    MaxSpareThreads       {{ httpd_max_spare_threads }}
+    MaxRequestWorkers     {{ httpd_max_request_workers }}
+    MaxConnectionsPerChild 0
+</IfModule>

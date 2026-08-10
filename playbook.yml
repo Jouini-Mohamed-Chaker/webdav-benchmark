@@ -200,6 +200,14 @@
     webdav_tmpfs_mount: /mnt/webdav_ram
     webdav_tmpfs_size: 12g
     webdav_serve_path: "{{ webdav_tmpfs_mount if use_tmpfs else webdav_disk_mount }}"
+    # ServerLimit * ThreadsPerChild must be >= MaxRequestWorkers.
+    # 16 * 64 = 1024, well above anything the benchmark throws at it (max 128
+    # concurrent), so worker-pool exhaustion is ruled out as a variable.
+    httpd_server_limit: 16
+    httpd_threads_per_child: 64
+    httpd_min_spare_threads: 75
+    httpd_max_spare_threads: 250
+    httpd_max_request_workers: 1024
   tasks:
     # --- Remove nginx from this box - it used to serve WebDAV here but
     # httpd/mod_dav has replaced it. Must be stopped before httpd can
@@ -326,6 +334,12 @@
         name: httpd_unified
         state: yes
         persistent: yes
+
+    - name: Deploy explicit MPM event tuning (worker/thread limits)
+      template:
+        src: templates/mpm_tuning.conf.j2
+        dest: /etc/httpd/conf.d/00-mpm-tuning.conf
+      notify: Restart httpd
 
     - name: Deploy Apache WebDAV vhost configuration
       template:
