@@ -12,7 +12,7 @@ Usage:
                               in one process.
   --budget 8192               tmpfs safety budget in MB (default 8192, leaves headroom under a 12g tmpfs)
 """
-import argparse, os, shutil, statistics, subprocess, sys, tempfile, time, threading
+import argparse, os, shutil, signal, statistics, subprocess, sys, tempfile, time, threading
 from concurrent.futures import ThreadPoolExecutor
 
 LEVELS_DEFAULT = [2, 4, 8, 16, 32, 48, 64, 96, 128]
@@ -88,13 +88,74 @@ class Rclone:
             return 0
         return len([l for l in out.splitlines() if l.strip()])
 
+    def list_root_dirs(self):
+        """Top-level directory names on the remote (used to find stale leftovers)."""
+        ok, out, err = run_capture(["rclone", "lsf", f"{self.remote}:", "--dirs-only"])
+        if not ok:
+            print(f"  [Warning] Could not list remote root for cleanup check: {err}")
+            return []
+        return [l.strip().rstrip("/") for l in out.splitlines() if l.strip()]
+
+    def list_root_files(self):
+        """Top-level file names on the remote (used to find stale leftovers)."""
+        ok, out, err = run_capture(["rclone", "lsf", f"{self.remote}:", "--files-only"])
+        if not ok:
+            print(f"  [Warning] Could not list remote root for cleanup check: {err}")
+            return []
+        return [l.strip() for l in out.splitlines() if l.strip()]
+
     def purge(self, remote_dir):
         ok, err = run(["rclone", "purge", f"{self.remote}:{remote_dir}"])
         if not ok and "directory not found" not in err.lower():
             print(f"\n  [Warning] Rclone purge failed for {remote_dir}: {err}")
+        return ok
+
+    def delete_file(self, remote_name):
+        ok, err = run(["rclone", "deletefile", f"{self.remote}:{remote_name}"])
+        if not ok and "not found" not in err.lower():
+            print(f"\n  [Warning] Rclone delete failed for {remote_name}: {err}")
+        return ok
 
 def gbit(total_bytes, secs):
     return round((total_bytes * 8) / secs / 1_000_000_000, 3) if secs > 0 else 0.0
+
+# Tracks remote paths created by THIS run so a crash/Ctrl-C can still clean up.
+# (dir_paths, file_paths) - populated as we go, drained as things succeed normally.
+_active_remote = {"dirs": set(), "files": set()}
+
+def preflight_cleanup(transport, prefix="bench_"):
+    """
+    Remove any stale bench_* directories/files left over from a previous run
+    that crashed or was killed before it could clean up after itself
+    (e.g. the proxy being unreachable mid-run, Ctrl-C, OOM, etc).
+    """
+    if not hasattr(transport, "list_root_dirs"):
+        return  # curl mode has nothing to pre-scan
+    stale_dirs = [d for d in transport.list_root_dirs() if d.startswith(prefix)]
+    stale_files = [f for f in transport.list_root_files() if f.startswith(prefix)]
+    if not stale_dirs and not stale_files:
+        return
+    print(f"Found {len(stale_dirs)} stale directory(ies) and {len(stale_files)} stale file(s) "
+          f"from a previous run - cleaning up before starting...")
+    for d in stale_dirs:
+        transport.purge(d)
+    for f in stale_files:
+        transport.delete_file(f)
+    print("Pre-flight cleanup done.\n")
+
+def emergency_cleanup(transport):
+    """Best-effort cleanup of whatever this run has created so far, called from
+    a signal handler or the top-level exception handler."""
+    for d in list(_active_remote["dirs"]):
+        if hasattr(transport, "purge"):
+            transport.purge(d)
+        _active_remote["dirs"].discard(d)
+    for f in list(_active_remote["files"]):
+        if hasattr(transport, "delete_file"):
+            transport.delete_file(f)
+        elif hasattr(transport, "delete"):
+            transport.delete(f)
+        _active_remote["files"].discard(f)
 
 def sweep(transport, direction, src_file, size_mb, levels, repeats, tag):
     """direction: 'upload' or 'download'. Returns {N: median_gbit}."""
@@ -122,9 +183,12 @@ def sweep(transport, direction, src_file, size_mb, levels, repeats, tag):
                 elapsed = time.time() - start
                 
                 # FIX: Only attempt to delete files that successfully uploaded
+                for nm in names:
+                    _active_remote["files"].add(nm)
                 for nm, res in zip(names, results_raw):
                     if res[0]: # res[0] is the boolean success flag
                         transport.delete(nm)
+                    _active_remote["files"].discard(nm)
             else:
                 remote_src = f"{tag}_download_src"
                 dst_dir = tempfile.mkdtemp(prefix="webdav_bench_dl_")
@@ -182,44 +246,50 @@ def sweep_rclone_native(transport, direction, src_file, size_mb, levels, repeats
                 os.link(src_file, os.path.join(seed_dir, f"s{i}"))
             ok, err = transport.copy_to_remote(seed_dir, seed_remote_dir, n)
             shutil.rmtree(seed_dir, ignore_errors=True)
+            _active_remote["dirs"].add(seed_remote_dir)
             if not ok or transport.count_remote(seed_remote_dir) < n:
                 transport.purge(seed_remote_dir)
+                _active_remote["dirs"].discard(seed_remote_dir)
                 die(f"Seeding {n} files for download sweep failed: {err}")
 
-        for r in range(1, repeats + 1):
-            print(f"\r{direction}: {n} transfers (native), run {r}/{repeats}...".ljust(60), end="", flush=True)
+        try:
+            for r in range(1, repeats + 1):
+                print(f"\r{direction}: {n} transfers (native), run {r}/{repeats}...".ljust(60), end="", flush=True)
 
-            if direction == "upload":
-                batch_dir = tempfile.mkdtemp(prefix="webdav_bench_up_")
-                for i in range(n):
-                    os.link(src_file, os.path.join(batch_dir, f"u{i}"))
-                remote_dir = f"{tag}_up_{n}_{r}"
+                if direction == "upload":
+                    batch_dir = tempfile.mkdtemp(prefix="webdav_bench_up_")
+                    for i in range(n):
+                        os.link(src_file, os.path.join(batch_dir, f"u{i}"))
+                    remote_dir = f"{tag}_up_{n}_{r}"
+                    _active_remote["dirs"].add(remote_dir)
 
-                start = time.time()
-                ok, err = transport.copy_to_remote(batch_dir, remote_dir, n)
-                elapsed = time.time() - start
+                    start = time.time()
+                    ok, err = transport.copy_to_remote(batch_dir, remote_dir, n)
+                    elapsed = time.time() - start
 
-                success = transport.count_remote(remote_dir)
-                transport.purge(remote_dir)
-                shutil.rmtree(batch_dir, ignore_errors=True)
-            else:
-                dst_dir = tempfile.mkdtemp(prefix="webdav_bench_dn_")
+                    success = transport.count_remote(remote_dir)
+                    transport.purge(remote_dir)
+                    _active_remote["dirs"].discard(remote_dir)
+                    shutil.rmtree(batch_dir, ignore_errors=True)
+                else:
+                    dst_dir = tempfile.mkdtemp(prefix="webdav_bench_dn_")
 
-                start = time.time()
-                ok, err = transport.copy_from_remote(seed_remote_dir, dst_dir, n)
-                elapsed = time.time() - start
+                    start = time.time()
+                    ok, err = transport.copy_from_remote(seed_remote_dir, dst_dir, n)
+                    elapsed = time.time() - start
 
-                success = len(os.listdir(dst_dir))
-                shutil.rmtree(dst_dir, ignore_errors=True)
+                    success = len(os.listdir(dst_dir))
+                    shutil.rmtree(dst_dir, ignore_errors=True)
 
-            fails += (n - success)
-            if not ok and err and sample_error[0] is None:
-                sample_error[0] = err
+                fails += (n - success)
+                if not ok and err and sample_error[0] is None:
+                    sample_error[0] = err
 
-            run_gbits.append(gbit(success * size_mb * 1_048_576, elapsed))
-
-        if seed_remote_dir:
-            transport.purge(seed_remote_dir)
+                run_gbits.append(gbit(success * size_mb * 1_048_576, elapsed))
+        finally:
+            if seed_remote_dir:
+                transport.purge(seed_remote_dir)
+                _active_remote["dirs"].discard(seed_remote_dir)
 
         med = statistics.median(run_gbits)
         results[n] = med
@@ -253,6 +323,15 @@ def main():
     transport = Curl(args.target, args.port) if args.mode == "curl" else Rclone(args.target)
     transport.check()
 
+    preflight_cleanup(transport, prefix="bench_")
+
+    def handle_interrupt(signum, frame):
+        print("\n\nInterrupted - cleaning up remote files before exit...")
+        emergency_cleanup(transport)
+        sys.exit(130)
+    signal.signal(signal.SIGINT, handle_interrupt)
+    signal.signal(signal.SIGTERM, handle_interrupt)
+
     tmpdir = tempfile.mkdtemp(prefix="webdav_bench_")
     src_file = os.path.join(tmpdir, f"source_{size_mb}MB")
     print(f"Generating {size_mb}MB source file...")
@@ -263,26 +342,34 @@ def main():
 
     tag = f"bench_{os.getpid()}"
 
-    if args.mode == "rclone":
-        # Native concurrency: one rclone process per run, --transfers N/--checkers N.
-        print(f"\n=== UPLOAD SWEEP ({transport.name} native, median of {args.repeats} runs) ===")
-        up_results = sweep_rclone_native(transport, "upload", src_file, size_mb, levels, args.repeats, tag)
+    try:
+        if args.mode == "rclone":
+            # Native concurrency: one rclone process per run, --transfers N/--checkers N.
+            print(f"\n=== UPLOAD SWEEP ({transport.name} native, median of {args.repeats} runs) ===")
+            up_results = sweep_rclone_native(transport, "upload", src_file, size_mb, levels, args.repeats, tag)
 
-        print(f"\n=== DOWNLOAD SWEEP ({transport.name} native, median of {args.repeats} runs) ===")
-        down_results = sweep_rclone_native(transport, "download", src_file, size_mb, levels, args.repeats, tag)
-    else:
-        # curl: N separate processes (curl has no built-in multi-transfer concurrency).
-        print(f"\n=== UPLOAD SWEEP ({transport.name}, median of {args.repeats} runs) ===")
-        up_results = sweep(transport, "upload", src_file, size_mb, levels, args.repeats, tag)
+            print(f"\n=== DOWNLOAD SWEEP ({transport.name} native, median of {args.repeats} runs) ===")
+            down_results = sweep_rclone_native(transport, "download", src_file, size_mb, levels, args.repeats, tag)
+        else:
+            # curl: N separate processes (curl has no built-in multi-transfer concurrency).
+            print(f"\n=== UPLOAD SWEEP ({transport.name}, median of {args.repeats} runs) ===")
+            up_results = sweep(transport, "upload", src_file, size_mb, levels, args.repeats, tag)
 
-        print(f"\n=== DOWNLOAD SWEEP ({transport.name}, median of {args.repeats} runs) ===")
-        seed_ok, seed_err = transport.upload(src_file, f"{tag}_download_src")
-        if not seed_ok:
-            die(f"Seed upload for download sweep failed: {seed_err}")
-        down_results = sweep(transport, "download", src_file, size_mb, levels, args.repeats, tag)
-        transport.delete(f"{tag}_download_src")
-
-    shutil.rmtree(tmpdir, ignore_errors=True)
+            print(f"\n=== DOWNLOAD SWEEP ({transport.name}, median of {args.repeats} runs) ===")
+            seed_name = f"{tag}_download_src"
+            seed_ok, seed_err = transport.upload(src_file, seed_name)
+            if not seed_ok:
+                die(f"Seed upload for download sweep failed: {seed_err}")
+            _active_remote["files"].add(seed_name)
+            down_results = sweep(transport, "download", src_file, size_mb, levels, args.repeats, tag)
+            transport.delete(seed_name)
+            _active_remote["files"].discard(seed_name)
+    except Exception:
+        print("\n\nRun failed - cleaning up any remote files created so far...")
+        emergency_cleanup(transport)
+        raise
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     print(f"\n=== SUMMARY ({transport.name}, Gbit/s median of {args.repeats} runs) ===")
     print(f"{'Streams':<10}{'Upload':>12}{'Download':>12}")
