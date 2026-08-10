@@ -24,8 +24,9 @@ def die(msg):
     sys.exit(f"ERROR: {msg}")
 
 def run(cmd):
-    """Run a command, return True on success (exit 0), False otherwise."""
-    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    """Run a command. Returns (success, stderr_text)."""
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    return r.returncode == 0, r.stderr.strip()
 
 class Curl:
     name = "curl"
@@ -50,14 +51,17 @@ class Rclone:
     def check(self):
         if not shutil.which("rclone"):
             die("rclone not found. Install: curl https://rclone.org/install.sh | sudo bash")
-        if not run(["rclone", "lsd", f"{self.remote}:"]):
-            die(f"Can't reach remote '{self.remote}'. Check ~/.config/rclone/rclone.conf and that the server is up.")
+        ok, err = run(["rclone", "lsd", f"{self.remote}:"])
+        if not ok:
+            die(f"Can't reach remote '{self.remote}': {err}")
     def upload(self, src_file, remote_name):
         return run(["rclone", "copyto", src_file, f"{self.remote}:{remote_name}",
-                     "--low-level-retries", "3", "--retries", "2", "--stats=0"])
+                     "--no-check-dest", "--low-level-retries", "1", "--retries", "1",
+                     "--contimeout", "10s", "--timeout", "15s", "--stats=0"])
     def download(self, remote_name, dst_file):
         return run(["rclone", "copyto", f"{self.remote}:{remote_name}", dst_file,
-                     "--low-level-retries", "3", "--retries", "2", "--stats=0"])
+                     "--low-level-retries", "1", "--retries", "1",
+                     "--contimeout", "10s", "--timeout", "15s", "--stats=0"])
     def delete(self, remote_name):
         run(["rclone", "deletefile", f"{self.remote}:{remote_name}"])
 
@@ -69,13 +73,14 @@ def sweep(transport, direction, src_file, size_mb, levels, repeats, tag):
     results = {}
     for n in levels:
         run_gbits, fails = [], 0
+        sample_error = [None]
         for r in range(1, repeats + 1):
             print(f"\r{direction}: {n} streams, run {r}/{repeats}...".ljust(60), end="", flush=True)
             names = [f"{tag}_{direction}_{n}_{r}_{i}" for i in range(n)]
             if direction == "upload":
                 start = time.time()
                 with ThreadPoolExecutor(max_workers=n) as ex:
-                    ok = list(ex.map(lambda nm: transport.upload(src_file, nm), names))
+                    results_raw = list(ex.map(lambda nm: transport.upload(src_file, nm), names))
                 elapsed = time.time() - start
                 for nm in names:
                     transport.delete(nm)
@@ -85,17 +90,24 @@ def sweep(transport, direction, src_file, size_mb, levels, repeats, tag):
                 dst_dir = tempfile.mkdtemp(prefix="webdav_bench_dl_")
                 start = time.time()
                 with ThreadPoolExecutor(max_workers=n) as ex:
-                    ok = list(ex.map(lambda nm: transport.download(remote_src, os.path.join(dst_dir, nm)), names))
+                    results_raw = list(ex.map(lambda nm: transport.download(remote_src, os.path.join(dst_dir, nm)), names))
                 elapsed = time.time() - start
                 shutil.rmtree(dst_dir, ignore_errors=True)
 
+            ok = [r[0] for r in results_raw]
+            errors = [r[1] for r in results_raw if not r[0] and r[1]]
             success = sum(ok)
             fails += (n - success)
+            if errors and sample_error[0] is None:
+                sample_error[0] = errors[0]
             run_gbits.append(gbit(success * size_mb * 1_000_000, elapsed))
         med = statistics.median(run_gbits)
         results[n] = med
         status = f"[{fails} total failures across {repeats} runs]" if fails else "[0 failures]"
         print(f"\r{direction.capitalize():10s} ({n:3d} streams): {med:8.3f} Gbit/s (median)  {status}".ljust(70))
+        if fails and sample_error[0]:
+            print(f"           sample error: {sample_error[0][:200]}")
+            sample_error[0] = None
     return results
 
 def main():
@@ -137,7 +149,9 @@ def main():
     up_results = sweep(transport, "upload", src_file, size_mb, levels, args.repeats, tag)
 
     print(f"\n=== DOWNLOAD SWEEP ({transport.name}, median of {args.repeats} runs) ===")
-    transport.upload(src_file, f"{tag}_download_src")
+    seed_ok, seed_err = transport.upload(src_file, f"{tag}_download_src")
+    if not seed_ok:
+        die(f"Seed upload for download sweep failed: {seed_err}")
     down_results = sweep(transport, "download", src_file, size_mb, levels, args.repeats, tag)
     transport.delete(f"{tag}_download_src")
 
