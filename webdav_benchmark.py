@@ -8,14 +8,8 @@ Usage:
 
   --levels "2 4 8 16 32 64"   override parallel stream counts (default: 2 4 8 16 32 48 64 96 128)
   --budget 8192               tmpfs safety budget in MB (default 8192, leaves headroom under a 12g tmpfs)
-
-Safety: --size is auto-capped so max_streams * size never exceeds --budget,
-same guardrail regardless of transport (this is what caused 507s before).
-
-Requires: curl mode needs `curl`; rclone mode needs `rclone` configured with
-the given remote name (see rclone.conf.template) pointed at .../dav.
 """
-import argparse, os, shutil, statistics, subprocess, sys, tempfile, time
+import argparse, os, shutil, statistics, subprocess, sys, tempfile, time, threading
 from concurrent.futures import ThreadPoolExecutor
 
 LEVELS_DEFAULT = [2, 4, 8, 16, 32, 48, 64, 96, 128]
@@ -37,12 +31,14 @@ class Curl:
             die("curl not found")
     def upload(self, src_file, remote_name):
         return run(["curl", "-T", src_file, f"{self.base}/{remote_name}",
-                     "--max-time", "15", "-o", "/dev/null", "-s", "-f"])
+                    "--max-time", "600", "-o", "/dev/null", "-s", "-f"])
     def download(self, remote_name, dst_file):
         return run(["curl", "-o", dst_file, f"{self.base}/{remote_name}",
-                     "--max-time", "15", "-s", "-f"])
+                    "--max-time", "600", "-s", "-f"])
     def delete(self, remote_name):
-        run(["curl", "-X", "DELETE", f"{self.base}/{remote_name}", "--max-time", "10", "-s", "-o", "/dev/null"])
+        ok, err = run(["curl", "-X", "DELETE", f"{self.base}/{remote_name}", "--max-time", "30", "-s", "-o", "/dev/null"])
+        if not ok:
+            print(f"\n  [Warning] Curl delete failed for {remote_name}: {err}")
 
 class Rclone:
     name = "rclone"
@@ -56,14 +52,16 @@ class Rclone:
             die(f"Can't reach remote '{self.remote}': {err}")
     def upload(self, src_file, remote_name):
         return run(["rclone", "copyto", src_file, f"{self.remote}:{remote_name}",
-                     "--no-check-dest", "--low-level-retries", "1", "--retries", "1",
-                     "--contimeout", "10s", "--timeout", "15s", "--stats=0"])
+                    "--no-check-dest", "--low-level-retries", "1", "--retries", "1",
+                    "--contimeout", "30s", "--timeout", "600s", "--stats=0"])
     def download(self, remote_name, dst_file):
         return run(["rclone", "copyto", f"{self.remote}:{remote_name}", dst_file,
-                     "--low-level-retries", "1", "--retries", "1",
-                     "--contimeout", "10s", "--timeout", "15s", "--stats=0"])
+                    "--low-level-retries", "1", "--retries", "1",
+                    "--contimeout", "30s", "--timeout", "600s", "--stats=0"])
     def delete(self, remote_name):
-        run(["rclone", "deletefile", f"{self.remote}:{remote_name}"])
+        ok, err = run(["rclone", "deletefile", f"{self.remote}:{remote_name}"])
+        if not ok:
+            print(f"\n  [Warning] Rclone delete failed for {remote_name}: {err}")
 
 def gbit(total_bytes, secs):
     return round((total_bytes * 8) / secs / 1_000_000_000, 3) if secs > 0 else 0.0
@@ -77,30 +75,51 @@ def sweep(transport, direction, src_file, size_mb, levels, repeats, tag):
         for r in range(1, repeats + 1):
             print(f"\r{direction}: {n} streams, run {r}/{repeats}...".ljust(60), end="", flush=True)
             names = [f"{tag}_{direction}_{n}_{r}_{i}" for i in range(n)]
+            
+            # Barrier ensures threads are fully spawned before starting the timer
+            barrier = threading.Barrier(n + 1)
+            
             if direction == "upload":
-                start = time.time()
+                def worker_up(nm):
+                    barrier.wait()
+                    return transport.upload(src_file, nm)
+                    
                 with ThreadPoolExecutor(max_workers=n) as ex:
-                    results_raw = list(ex.map(lambda nm: transport.upload(src_file, nm), names))
+                    futures = [ex.submit(worker_up, nm) for nm in names]
+                    barrier.wait() # Main thread waits for all workers to be ready
+                    start = time.time()
+                    results_raw = [f.result() for f in futures]
                 elapsed = time.time() - start
+                
                 for nm in names:
                     transport.delete(nm)
             else:
-                # single shared remote source, fetched N times concurrently
                 remote_src = f"{tag}_download_src"
                 dst_dir = tempfile.mkdtemp(prefix="webdav_bench_dl_")
-                start = time.time()
+                
+                def worker_dn(nm):
+                    barrier.wait()
+                    return transport.download(remote_src, os.path.join(dst_dir, nm))
+                    
                 with ThreadPoolExecutor(max_workers=n) as ex:
-                    results_raw = list(ex.map(lambda nm: transport.download(remote_src, os.path.join(dst_dir, nm)), names))
+                    futures = [ex.submit(worker_dn, nm) for nm in names]
+                    barrier.wait() # Main thread waits for all workers to be ready
+                    start = time.time()
+                    results_raw = [f.result() for f in futures]
                 elapsed = time.time() - start
+                
                 shutil.rmtree(dst_dir, ignore_errors=True)
 
-            ok = [r[0] for r in results_raw]
-            errors = [r[1] for r in results_raw if not r[0] and r[1]]
+            ok = [res[0] for res in results_raw]
+            errors = [res[1] for res in results_raw if not res[0] and res[1]]
             success = sum(ok)
             fails += (n - success)
             if errors and sample_error[0] is None:
                 sample_error[0] = errors[0]
-            run_gbits.append(gbit(success * size_mb * 1_000_000, elapsed))
+            
+            # Using 1,048,576 bytes because files are created with 1024 * 1024 chunks
+            run_gbits.append(gbit(success * size_mb * 1_048_576, elapsed))
+            
         med = statistics.median(run_gbits)
         results[n] = med
         status = f"[{fails} total failures across {repeats} runs]" if fails else "[0 failures]"
@@ -124,12 +143,11 @@ def main():
     levels = sorted(int(x) for x in args.levels.split())
     max_level = levels[-1]
 
-    # tmpfs safety: cap size so max_streams * size never exceeds the budget,
-    # same guardrail for both transports.
-    max_safe = args.budget // max_level
+    # tmpfs safety: +1 accounts for the single src_file that is also in the temp folder
+    max_safe = args.budget // (max_level + 1)
     size_mb = min(args.size, max_safe)
     if size_mb < args.size:
-        print(f"NOTE: requested {args.size}MB/stream would need {max_level * args.size}MB at "
+        print(f"NOTE: requested {args.size}MB/stream would need {(max_level + 1) * args.size}MB at "
               f"{max_level} streams - capping to {size_mb}MB to fit {args.budget}MB tmpfs budget.")
 
     transport = Curl(args.target, args.port) if args.mode == "curl" else Rclone(args.target)
