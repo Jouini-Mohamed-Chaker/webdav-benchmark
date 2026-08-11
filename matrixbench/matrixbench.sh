@@ -45,6 +45,9 @@ cmd_generate() {
   local size_gb="${2:-20}"
   echo "==> checking free RAM on $BACKEND_HOST"
   ssh "root@${BACKEND_HOST}" free -h
+  echo "==> ensuring results dir exists with correct ownership/SELinux context"
+  ssh "root@${BACKEND_HOST}" \
+    "mkdir -p '$RESULTS_DIR' && chown apache:apache '$RESULTS_DIR' && chmod 0775 '$RESULTS_DIR' && restorecon -R '$(dirname "$RESULTS_DIR")'"
   echo "==> generating dataset on $BACKEND_HOST (dim=$dim size=${size_gb}GB)"
   ssh "root@${BACKEND_HOST}" \
     "$BIN_REMOTE" generate -dir "$DATASET_DIR" -size-gb "$size_gb" -dim "$dim" -force
