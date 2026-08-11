@@ -198,7 +198,7 @@
     webdav_disk_mount: /data/webdav
     use_tmpfs: true
     webdav_tmpfs_mount: /mnt/webdav_ram
-    webdav_tmpfs_size: 12g
+    webdav_tmpfs_size: 90%
     webdav_serve_path: "{{ webdav_tmpfs_mount if use_tmpfs else webdav_disk_mount }}"
     # ServerLimit * ThreadsPerChild must be >= MaxRequestWorkers.
     # 16 * 64 = 1024, well above anything the benchmark throws at it (max 128

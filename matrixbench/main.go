@@ -4,9 +4,9 @@
 // on a target filesystem (ramdisk, tmpfs, or a real disk mount). N
 // concurrent sessions each repeatedly:
 //
-//  1. read two random matrices from the shared pool off disk
-//  2. multiply them (CPU-heavy, via gonum)
-//  3. write the result back to disk (to a per-session result file)
+//	1. read two random matrices from the shared pool off disk
+//	2. multiply them (CPU-heavy, via gonum)
+//	3. write the result back to disk (to a per-session result file)
 //
 // This exercises sustained concurrent read pressure, CPU, and write
 // pressure at the same time, unlike a plain sequential-copy benchmark.
@@ -24,7 +24,7 @@ import (
 	"os"
 )
 
-func main(){
+func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
@@ -44,19 +44,24 @@ func main(){
 	}
 }
 
-func usage(){
-	fmt.Fprintln(os.Stderr, `matrixbench - synthetic ramdisk/disk read-multiply-write stress test
- 
+func usage() {
+	fmt.Fprintln(os.Stderr, `matrixbench - synthetic read->multiply->write stress test
+
 Subcommands:
-  generate   Create the shared matrix dataset on the target filesystem
-  run        Run N concurrent read->multiply->write sessions against it
- 
+  generate   Create the shared matrix dataset (run locally on the box
+             serving the data - it must land inside the WebDAV-served
+             path so 'run -transport=webdav' can see it too)
+  run        Run N concurrent read->multiply->write sessions, either
+             directly on local disk/ramdisk (-transport=local) or over
+             HTTP/WebDAV, direct or through the nginx proxy
+             (-transport=webdav -webdav-url ...)
+
 Run "matrixbench generate -h" or "matrixbench run -h" for flags.`)
 }
 
 // exitOnFlagErr is a small helper so subcommands can share flag.ErrHelp
 // handling without duplicating boilerplate.
-func exitOnFlagErr(fs *flag.FlagSet, err error){
+func exitOnFlagErr(fs *flag.FlagSet, err error) {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		fs.Usage()

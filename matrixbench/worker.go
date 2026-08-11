@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"math"
 	"math/rand"
 	"os"
@@ -22,8 +20,17 @@ import (
 
 func runWorkload(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	dir := fs.String("dir", "", "dataset directory produced by 'generate' (required)")
-	resultsDir := fs.String("results-dir", "", "directory for per-session result output (required)")
+
+	transport := fs.String("transport", "local", "'local' (read/write ramdisk or disk directly on this box) or 'webdav' (read/write over HTTP, direct or through the nginx proxy)")
+
+	// local transport flags
+	dir := fs.String("dir", "", "[local] dataset directory produced by 'generate' (required for -transport=local)")
+	resultsDir := fs.String("results-dir", "", "[local] directory for per-session result output (required for -transport=local)")
+
+	// webdav transport flags
+	webdavURL := fs.String("webdav-url", "", "[webdav] base DAV URL, e.g. http://rhel-backend:8080/dav or http://<proxy-host>:8080/dav (required for -transport=webdav)")
+	httpTimeout := fs.Duration("http-timeout", 60*time.Second, "[webdav] per-request HTTP timeout")
+
 	sessions := fs.Int("sessions", 20, "number of concurrent read->multiply->write sessions")
 	duration := fs.Duration("duration", 30*time.Minute, "how long to run (0 = until cycles limit or Ctrl-C)")
 	cycles := fs.Int("cycles", 0, "max cycles per session (0 = unlimited, bounded by -duration instead)")
@@ -32,24 +39,47 @@ func runWorkload(args []string) {
 	maxConsecFail := fs.Int("max-consecutive-failures", 5, "mark a session degraded after this many consecutive cycle failures (it keeps retrying regardless)")
 	fs.Parse(args)
 
-	if *dir == "" || *resultsDir == "" {
-		fmt.Fprintln(os.Stderr, "run: -dir and -results-dir are required")
-		fs.Usage()
+	var datasetStore, resultsStore Storage
+
+	switch *transport {
+	case "local":
+		if *dir == "" || *resultsDir == "" {
+			fmt.Fprintln(os.Stderr, "run -transport=local: -dir and -results-dir are required")
+			fs.Usage()
+			os.Exit(2)
+		}
+		if err := os.MkdirAll(*resultsDir, 0o775); err != nil {
+			fmt.Fprintf(os.Stderr, "run: mkdir %s: %v\n", *resultsDir, err)
+			os.Exit(1)
+		}
+		datasetStore = newLocalStorage(*dir)
+		resultsStore = newLocalStorage(*resultsDir)
+
+	case "webdav":
+		if *webdavURL == "" {
+			fmt.Fprintln(os.Stderr, "run -transport=webdav: -webdav-url is required, e.g. http://rhel-backend:8080/dav")
+			fs.Usage()
+			os.Exit(2)
+		}
+		datasetStore = newWebdavStorage(*webdavURL+"/matrixbench/dataset", *httpTimeout)
+		resultsStore = newWebdavStorage(*webdavURL+"/matrixbench/results", *httpTimeout)
+		if err := resultsStore.EnsureCollection(""); err != nil {
+			fmt.Fprintf(os.Stderr, "run: creating results collection: %v\n", err)
+			os.Exit(1)
+		}
+
+	default:
+		fmt.Fprintf(os.Stderr, "run: unknown -transport %q (want 'local' or 'webdav')\n", *transport)
 		os.Exit(2)
 	}
 
-	manifest, err := loadManifest(*dir)
+	manifest, err := loadManifest(datasetStore)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "run: loading manifest from %s: %v\n(did you run 'matrixbench generate' first?)\n", *dir, err)
+		fmt.Fprintf(os.Stderr, "run: loading manifest: %v\n(did you run 'matrixbench generate' first, on the backend?)\n", err)
 		os.Exit(1)
 	}
 	if manifest.MatrixCount < 2 {
 		fmt.Fprintln(os.Stderr, "run: dataset has fewer than 2 matrices, can't multiply")
-		os.Exit(1)
-	}
-
-	if err := os.MkdirAll(*resultsDir, 0o775); err != nil {
-		fmt.Fprintf(os.Stderr, "run: mkdir %s: %v\n", *resultsDir, err)
 		os.Exit(1)
 	}
 
@@ -69,27 +99,35 @@ func runWorkload(args []string) {
 		defer cancel()
 	}
 
-	fmt.Printf("matrixbench run: %d sessions, dataset=%d matrices (%dx%d, %.2fGB) at %s\n",
-		*sessions, manifest.MatrixCount, manifest.MatrixDim, manifest.MatrixDim,
-		float64(manifest.TotalBytes)/(1<<30), *dir)
-	fmt.Printf("results -> %s | stats -> %s | duration=%s cycles=%d(0=unlimited)\n",
-		*resultsDir, *statsPath, duration.String(), *cycles)
+	fmt.Printf("matrixbench run: transport=%s sessions=%d dataset=%d matrices (%dx%d, %.2fGB)\n",
+		*transport, *sessions, manifest.MatrixCount, manifest.MatrixDim, manifest.MatrixDim,
+		float64(manifest.TotalBytes)/(1<<30))
+	fmt.Printf("dataset <- %s | results -> %s | stats -> %s | duration=%s cycles=%d(0=unlimited)\n",
+		datasetStore.Describe(), resultsStore.Describe(), *statsPath, duration.String(), *cycles)
 
 	var wg sync.WaitGroup
 	for i := 0; i < *sessions; i++ {
 		wg.Add(1)
 		go func(sessionID int) {
 			defer wg.Done()
-			sessionResultDir := filepath.Join(*resultsDir, fmt.Sprintf("session-%02d", sessionID))
-			if err := os.MkdirAll(sessionResultDir, 0o775); err != nil {
-				stats.recordFatal(sessionID, fmt.Errorf("mkdir session result dir: %w", err))
-				return
+
+			sessionResults := resultsStore
+			if *transport == "local" {
+				// Local mode keeps the original per-session subdirectory
+				// layout (cheap on a real/tmpfs filesystem, easy to
+				// inspect by hand).
+				subDir := filepath.Join(*resultsDir, fmt.Sprintf("session-%02d", sessionID))
+				if err := os.MkdirAll(subDir, 0o775); err != nil {
+					stats.recordFatal(sessionID, fmt.Errorf("mkdir session result dir: %w", err))
+					return
+				}
+				sessionResults = newLocalStorage(subDir)
 			}
-			runSession(ctx, sessionID, *dir, sessionResultDir, manifest, *cycles, *maxConsecFail, stats)
+
+			runSession(ctx, sessionID, datasetStore, sessionResults, manifest, *cycles, *maxConsecFail, *transport, stats)
 		}(i)
 	}
 
-	// Periodic human-readable summary while sessions run.
 	go func() {
 		ticker := time.NewTicker(*reportEvery)
 		defer ticker.Stop()
@@ -108,10 +146,19 @@ func runWorkload(args []string) {
 	stats.printFinal()
 }
 
-func runSession(ctx context.Context, sessionID int, datasetDir, resultDir string, m *Manifest, maxCycles, maxConsecFail int, stats *statsSink) {
+// runSession repeatedly picks two random matrices from the dataset store,
+// reads them, multiplies them, and writes the result to this session's
+// result store. Errors are logged and retried, never fatal to the loop -
+// that's the stability contract this tool is testing for.
+func runSession(ctx context.Context, sessionID int, dataset, results Storage, m *Manifest, maxCycles, maxConsecFail int, transport string, stats *statsSink) {
 	rng := rand.New(rand.NewSource(int64(sessionID) + 1))
 	consecFail := 0
 	cycle := 0
+
+	resultName := "result.bin"
+	if transport == "webdav" {
+		resultName = fmt.Sprintf("session-%02d-result.bin", sessionID)
+	}
 
 	for {
 		select {
@@ -133,22 +180,22 @@ func runSession(ctx context.Context, sessionID int, datasetDir, resultDir string
 		}
 
 		t0 := time.Now()
-		a, err := readMatrix(filepath.Join(datasetDir, fmt.Sprintf("matrix_%05d.bin", idxA)), m.MatrixDim)
+		a, err := readMatrix(dataset, fmt.Sprintf("matrix_%05d.bin", idxA), m.MatrixDim)
+		var b *mat.Dense
 		if err == nil {
-			var b *mat.Dense
-			b, err = readMatrix(filepath.Join(datasetDir, fmt.Sprintf("matrix_%05d.bin", idxB)), m.MatrixDim)
-			rec.ReadMS = time.Since(t0).Seconds() * 1000
+			b, err = readMatrix(dataset, fmt.Sprintf("matrix_%05d.bin", idxB), m.MatrixDim)
+		}
+		rec.ReadMS = time.Since(t0).Seconds() * 1000
 
-			if err == nil {
-				t1 := time.Now()
-				var c mat.Dense
-				c.Mul(a, b)
-				rec.ComputeMS = time.Since(t1).Seconds() * 1000
+		if err == nil {
+			t1 := time.Now()
+			var c mat.Dense
+			c.Mul(a, b)
+			rec.ComputeMS = time.Since(t1).Seconds() * 1000
 
-				t2 := time.Now()
-				err = writeMatrix(filepath.Join(resultDir, "result.bin"), &c, m.MatrixDim)
-				rec.WriteMS = time.Since(t2).Seconds() * 1000
-			}
+			t2 := time.Now()
+			err = writeMatrix(results, resultName, &c, m.MatrixDim)
+			rec.WriteMS = time.Since(t2).Seconds() * 1000
 		}
 
 		rec.TotalMS = time.Since(t0).Seconds() * 1000
@@ -159,9 +206,6 @@ func runSession(ctx context.Context, sessionID int, datasetDir, resultDir string
 			if consecFail >= maxConsecFail {
 				stats.markDegraded(sessionID, consecFail)
 			}
-			// Deliberately keep looping - a single bad cycle should not
-			// kill the session. Stability means surviving faults, not
-			// crashing on the first one. We just log and retry.
 			continue
 		}
 		consecFail = 0
@@ -169,82 +213,70 @@ func runSession(ctx context.Context, sessionID int, datasetDir, resultDir string
 	}
 }
 
-func readMatrix(path string, expectDim int) (*mat.Dense, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", path, err)
-	}
-	defer f.Close()
+// --- matrix <-> byte encoding, shared by local and webdav storage ---
+// Layout: [uint32 dim little-endian][dim*dim float32 little-endian]
 
-	r := bufio.NewReaderSize(f, 4<<20)
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, fmt.Errorf("read header %s: %w", path, err)
-	}
-	dim := int(binary.LittleEndian.Uint32(hdr[:]))
-	if dim != expectDim {
-		return nil, fmt.Errorf("%s: dim mismatch, file has %d, manifest says %d", path, dim, expectDim)
-	}
-
-	n := dim * dim
-	data := make([]float64, n)
-	buf := make([]byte, 4)
-	for i := 0; i < n; i++ {
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, fmt.Errorf("read data %s at elem %d: %w", path, i, err)
-		}
-		bits := binary.LittleEndian.Uint32(buf)
-		data[i] = float64(math.Float32frombits(bits))
-	}
-	return mat.NewDense(dim, dim, data), nil
-}
-
-func writeMatrix(path string, m *mat.Dense, dim int) error {
-	// Write to a temp file then rename, so a partial/failed write never
-	// leaves a corrupt result.bin behind for a later reader.
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", tmp, err)
-	}
-	w := bufio.NewWriterSize(f, 4<<20)
-
-	var hdr [4]byte
-	binary.LittleEndian.PutUint32(hdr[:], uint32(dim))
-	if _, err := w.Write(hdr[:]); err != nil {
-		f.Close()
-		return err
-	}
-
-	buf := make([]byte, 4)
+func encodeMatrix(m *mat.Dense, dim int) []byte {
+	buf := make([]byte, 4+dim*dim*4)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(dim))
 	r, c := m.Dims()
+	off := 4
 	for i := 0; i < r; i++ {
 		for j := 0; j < c; j++ {
-			binary.LittleEndian.PutUint32(buf, math.Float32bits(float32(m.At(i, j))))
-			if _, err := w.Write(buf); err != nil {
-				f.Close()
-				return err
-			}
+			binary.LittleEndian.PutUint32(buf[off:off+4], math.Float32bits(float32(m.At(i, j))))
+			off += 4
 		}
 	}
-	if err := w.Flush(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return buf
 }
 
-func loadManifest(dir string) (*Manifest, error) {
-	f, err := os.Open(filepath.Join(dir, manifestName))
+func decodeMatrix(data []byte, expectDim int) (*mat.Dense, error) {
+	if len(data) < 4 {
+		return nil, fmt.Errorf("short read: %d bytes", len(data))
+	}
+	dim := int(binary.LittleEndian.Uint32(data[0:4]))
+	if dim != expectDim {
+		return nil, fmt.Errorf("dim mismatch: file has %d, manifest says %d", dim, expectDim)
+	}
+	want := 4 + dim*dim*4
+	if len(data) != want {
+		return nil, fmt.Errorf("size mismatch: got %d bytes, want %d", len(data), want)
+	}
+	out := make([]float64, dim*dim)
+	off := 4
+	for i := range out {
+		out[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(data[off : off+4])))
+		off += 4
+	}
+	return mat.NewDense(dim, dim, out), nil
+}
+
+func readMatrix(s Storage, name string, expectDim int) (*mat.Dense, error) {
+	data, err := s.Read(name)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", name, err)
+	}
+	m, err := decodeMatrix(data, expectDim)
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", name, err)
+	}
+	return m, nil
+}
+
+func writeMatrix(s Storage, name string, m *mat.Dense, dim int) error {
+	if err := s.Write(name, encodeMatrix(m, dim)); err != nil {
+		return fmt.Errorf("write %s: %w", name, err)
+	}
+	return nil
+}
+
+func loadManifest(s Storage) (*Manifest, error) {
+	data, err := s.Read(manifestName)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 	var m Manifest
-	if err := json.NewDecoder(f).Decode(&m); err != nil {
+	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
 	return &m, nil
