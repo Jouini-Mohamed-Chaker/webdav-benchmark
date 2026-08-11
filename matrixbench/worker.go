@@ -63,9 +63,14 @@ func runWorkload(args []string) {
 		}
 		datasetStore = newWebdavStorage(*webdavURL+"/matrixbench/dataset", *httpTimeout)
 		resultsStore = newWebdavStorage(*webdavURL+"/matrixbench/results", *httpTimeout)
+		// Best-effort only: different WebDAV server configs return different
+		// codes for "collection already exists" (405/409/sometimes 403), and
+		// the collection is expected to already exist here (created by the
+		// playbook). Don't block the run on this - a real permission problem
+		// will surface clearly on the actual writes below instead.
 		if err := resultsStore.EnsureCollection(""); err != nil {
-			fmt.Fprintf(os.Stderr, "run: creating results collection: %v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(os.Stderr, "run: warning: could not confirm results collection exists: %v\n", err)
+			fmt.Fprintln(os.Stderr, "run: continuing anyway - if writes then fail with a permission/404 error, the collection genuinely needs fixing")
 		}
 
 	default:
