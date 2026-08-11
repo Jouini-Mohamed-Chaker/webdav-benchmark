@@ -89,6 +89,9 @@ func newWebdavStorage(baseURL string, timeout time.Duration) *webdavStorage {
 }
 
 func (s *webdavStorage) url(name string) string {
+	if name == "" {
+		return s.baseURL
+	}
 	return s.baseURL + "/" + path.Clean(name)
 }
 
