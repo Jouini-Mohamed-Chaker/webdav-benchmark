@@ -317,6 +317,27 @@
         group: apache
         mode: '0775'
 
+    # --- matrixbench dataset/results dirs, pre-created here (not via a
+    # runtime MKCOL from the client) so restorecon below actually covers
+    # them. A directory created later via a live WebDAV MKCOL doesn't
+    # reliably pick up the right SELinux context on tmpfs, which is what
+    # caused "Permission denied" 500s on every PUT during testing.
+    - name: Ensure matrixbench dataset dir exists INSIDE serve path
+      file:
+        path: "{{ webdav_serve_path }}/matrixbench/dataset"
+        state: directory
+        owner: apache
+        group: apache
+        mode: '0775'
+
+    - name: Ensure matrixbench results dir exists INSIDE serve path
+      file:
+        path: "{{ webdav_serve_path }}/matrixbench/results"
+        state: directory
+        owner: apache
+        group: apache
+        mode: '0775'
+
     - name: Apply SELinux context to serve + tmp paths
       command: restorecon -R {{ webdav_serve_path }}
       changed_when: false
