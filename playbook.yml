@@ -16,8 +16,13 @@
           - policycoreutils-python-utils
           - numactl
           - sysstat
+          - iperf3
         state: present
 
+    - name: Deploy iperf3 systemd service
+      template:
+        src: 
+    
     - name: Install Nginx (proxy role only)
       dnf:
         name: nginx
@@ -196,10 +201,7 @@
   vars:
     webdav_disk: /dev/sdb
     webdav_disk_mount: /data/webdav
-    use_tmpfs: true
-    webdav_tmpfs_mount: /mnt/webdav_ram
-    webdav_tmpfs_size: 90%
-    webdav_serve_path: "{{ webdav_tmpfs_mount if use_tmpfs else webdav_disk_mount }}"
+    webdav_serve_path: "{{ webdav_disk_mount }}"
     # ServerLimit * ThreadsPerChild must be >= MaxRequestWorkers.
     # 16 * 64 = 1024, well above anything the benchmark throws at it (max 128
     # concurrent), so worker-pool exhaustion is ruled out as a variable.
@@ -277,32 +279,6 @@
         content: |
           ACTION=="add|change", KERNEL=="sdb", ATTR{queue/scheduler}="none"
 
-    # --- tmpfs, used to serve WebDAV so the disk isn't the bottleneck ---
-    - name: Ensure tmpfs mount point exists
-      file:
-        path: "{{ webdav_tmpfs_mount }}"
-        state: directory
-        owner: apache
-        group: apache
-        mode: '0775'
-      when: use_tmpfs
-
-    - name: Persist tmpfs mount in fstab and mount now
-      mount:
-        path: "{{ webdav_tmpfs_mount }}"
-        src: tmpfs
-        fstype: tmpfs
-        opts: "size={{ webdav_tmpfs_size }},uid=apache,gid=apache,mode=0775"
-        state: mounted
-      when: use_tmpfs
-
-    - name: Set SELinux permissions for tmpfs WebDAV directory
-      sefcontext:
-        target: '{{ webdav_tmpfs_mount }}(/.*)?'
-        setype: httpd_sys_rw_content_t
-        state: present
-      when: use_tmpfs
-
     - name: Set SELinux permissions for tmp upload dir
       sefcontext:
         target: '{{ webdav_serve_path }}/.uploadtmp(/.*)?'
@@ -312,27 +288,6 @@
     - name: Ensure tmp upload dir exists INSIDE serve path (same fs - cheap rename, no cross-device copy)
       file:
         path: "{{ webdav_serve_path }}/.uploadtmp"
-        state: directory
-        owner: apache
-        group: apache
-        mode: '0775'
-
-    # --- matrixbench dataset/results dirs, pre-created here (not via a
-    # runtime MKCOL from the client) so restorecon below actually covers
-    # them. A directory created later via a live WebDAV MKCOL doesn't
-    # reliably pick up the right SELinux context on tmpfs, which is what
-    # caused "Permission denied" 500s on every PUT during testing.
-    - name: Ensure matrixbench dataset dir exists INSIDE serve path
-      file:
-        path: "{{ webdav_serve_path }}/matrixbench/dataset"
-        state: directory
-        owner: apache
-        group: apache
-        mode: '0775'
-
-    - name: Ensure matrixbench results dir exists INSIDE serve path
-      file:
-        path: "{{ webdav_serve_path }}/matrixbench/results"
         state: directory
         owner: apache
         group: apache
@@ -483,14 +438,12 @@
         daemon_reload: yes
 
 # -----------------------------------------------------------
-# Benchmarking is NOT run through Ansible anymore.
+# Benchmarking is NOT run through Ansible.
 # This playbook only provisions the environment (packages, NIC/sysctl
-# tuning, nginx proxy, apache/mod_dav backend). Once a run completes,
-# benchmark manually from the Ubuntu client with:
+# tuning, nginx proxy, apache/mod_dav backend on real disk, iperf3).
+# Once a run completes, benchmark manually from the Ubuntu client with:
 #
-#   ./benchmark.sh <proxy-ip> 8080 <file_size_mb> <parallel_file_mb> <repeats>
-#   ./rclone_benchmark.sh webdav_proxy <file_size_mb> <repeats>
-#   ./rclone_benchmark.sh webdav_direct <file_size_mb> <repeats>   # bypass proxy
+#   ./bench.sh <target-host> <webdav-url> [size_mb] [repeats]
 #
 # This keeps iteration fast (no full playbook run needed per test) and
 # keeps the provisioning code idempotent/safe to re-run independently.
