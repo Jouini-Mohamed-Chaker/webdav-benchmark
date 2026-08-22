@@ -22,18 +22,13 @@ go build -o webdav-benchmark .
 ```bash
 ./run-ansible.sh
 ```
-This only configures nginx, httpd/mod_dav, and the disk-backed WebDAV share
-(no benchmarking happens here).
+This configures nginx, httpd/mod_dav, and the disk-backed WebDAV share, and
+also deploys/starts an `iperf3` systemd service on the proxy and backend
+boxes (restarted cleanly on every re-run, so it never piles up duplicate
+processes). No benchmarking happens here - iperf3 is just left running and
+ready.
 
-## 2. Start iperf3 server on the target
-
-```bash
-ssh root@192.168.95.1 iperf3 -s -D   # proxy box
-# or
-ssh root@192.168.95.2 iperf3 -s -D   # backend box, for a direct test
-```
-
-## 3. Run the combined benchmark
+## 2. Run the combined benchmark
 
 ```bash
 ./bench.sh <target-host> <webdav-url> [size_mb] [repeats]
@@ -48,7 +43,7 @@ ssh root@192.168.95.2 iperf3 -s -D   # backend box, for a direct test
 ## Or run each piece manually
 
 ```bash
-# baseline
+# baseline (iperf3 server is already running via Ansible/systemd)
 iperf3 -c 192.168.95.1 -t 10 -P 4
 
 # WebDAV only
