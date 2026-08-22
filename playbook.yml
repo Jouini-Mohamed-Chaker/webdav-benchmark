@@ -58,6 +58,12 @@
         permanent: yes
         state: enabled
         immediate: yes
+    - name: Allow iperf3 port in Firewalld
+      firewalld:
+        port: 5201/tcp
+        permanent: yes
+        state: enabled
+        immediate: yes
 
     # -----------------------------------------------------------
     # Detect which NIC sits on the NUMA-enabled 192.168.95.0/24 net
