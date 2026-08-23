@@ -34,7 +34,7 @@ import (
 // saturate the backend's disk writeback and time out an entire run rather
 // than degrading gracefully - see README for details. Pass -levels
 // explicitly to go higher.
-var defaultConcurrencyLevels = []int{2, 4, 8, 16, 32}
+var defaultConcurrencyLevels = []int{2, 4, 8, 16}
 
 func printErrorAndExit(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "ERROR: "+format+"\n", args...)

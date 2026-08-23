@@ -30,7 +30,7 @@ echo "=================================================="
 echo "NOTE: the iperf3 server is started/managed by Ansible - if this fails,"
 echo "check 'systemctl status iperf3' on $TARGET_HOST."
 
-IPERF_JSON=$(iperf3 -c "$TARGET_HOST" -t 10 -P "$MAX_LEVEL" -J)
+IPERF_JSON=$(iperf3 -c "$TARGET_HOST" -t 10 -P "$MAX_LEVEL" -Z -J)
 echo "$IPERF_JSON" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
