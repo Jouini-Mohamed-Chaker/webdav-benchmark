@@ -15,8 +15,20 @@ server {
     location / {
         proxy_pass http://webdav_backend_pool;
 
+        # Uploads (client -> backend): stream the request body straight
+        # through instead of buffering it in nginx first - avoids doubling
+        # up 200MB+ PUTs in memory/disk before they even reach httpd.
         proxy_request_buffering off;
-        proxy_buffering off;
+
+        # Downloads (backend -> client): buffer the response so nginx can
+        # do large efficient reads from the upstream socket and forward
+        # them in bigger chunks, instead of a tight small-chunk read/write
+        # loop per byte. This was previously "off" and was the main source
+        # of the ~5x download throughput gap vs a direct connection.
+        proxy_buffering on;
+        proxy_buffer_size 64k;
+        proxy_buffers 8 64k;
+        proxy_busy_buffers_size 128k;
         proxy_max_temp_file_size 0;
 
         proxy_http_version 1.1;
