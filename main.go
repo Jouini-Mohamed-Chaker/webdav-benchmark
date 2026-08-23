@@ -34,7 +34,7 @@ import (
 // saturate the backend's disk writeback and time out an entire run rather
 // than degrading gracefully - see README for details. Pass -levels
 // explicitly to go higher.
-var defaultConcurrencyLevels = []int{2, 4, 8}
+var defaultConcurrencyLevels = []int{2, 4, 8, 16, 32}
 
 func printErrorAndExit(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "ERROR: "+format+"\n", args...)
@@ -274,8 +274,10 @@ func stoppedByUser(ctx context.Context) bool {
 
 // runTransferBenchmark sweeps upload or download throughput across
 // concurrency levels. For "download" it first uploads one shared source
-// file that every concurrent stream then downloads.
-func runTransferBenchmark(ctx context.Context, client *WebDAVClient, out io.Writer, direction string, fileData []byte, fileSizeMB int, concurrencyLevels []int, repeatsPerLevel int, runTag string) map[int]ConcurrencyLevelResult {
+// file that every concurrent stream then downloads. When
+// networkBaselineGbit > 0, each printed line also shows overhead vs that
+// baseline, so there's no separate table needed afterwards.
+func runTransferBenchmark(ctx context.Context, client *WebDAVClient, out io.Writer, direction string, fileData []byte, fileSizeMB int, concurrencyLevels []int, repeatsPerLevel int, runTag string, networkBaselineGbit float64) map[int]ConcurrencyLevelResult {
 	results := map[int]ConcurrencyLevelResult{}
 
 	sharedDownloadSource := runTag + "_download_source"
@@ -322,8 +324,9 @@ func runTransferBenchmark(ctx context.Context, client *WebDAVClient, out io.Writ
 
 		median := medianOf(throughputSamples)
 		results[streams] = ConcurrencyLevelResult{ConcurrentStreams: streams, MedianResult: median, FailedOperations: failures}
-		fmt.Fprintf(out, "\r%-10s (%3d streams): %8.3f Gbit/s (median)  [%d failures across %d runs]          \n",
-			capitalize(direction), streams, median, failures, repeatsPerLevel)
+		fmt.Fprintf(out, "\r%s %2d streams: %7.3f Gbit/s%s%s\n",
+			padRightTo(capitalize(direction), 8), streams, median,
+			overheadSuffix(median, networkBaselineGbit), failureSuffix(failures, repeatsPerLevel))
 	}
 	return results
 }
@@ -368,47 +371,64 @@ func runOperationBenchmark(ctx context.Context, client *WebDAVClient, out io.Wri
 
 		median := medianOf(opsPerSecondSamples)
 		results[streams] = ConcurrencyLevelResult{ConcurrentStreams: streams, MedianResult: median, FailedOperations: failures}
-		fmt.Fprintf(out, "\r%-10s (%3d concurrent): %8.1f ops/s (median)  [%d failures across %d runs]          \n",
-			operationName, streams, median, failures, repeatsPerLevel)
+		fmt.Fprintf(out, "\r%s %2d concurrent: %8.1f ops/s%s\n",
+			padRightTo(capitalize(operationName), 8), streams, median, failureSuffix(failures, repeatsPerLevel))
 	}
 	return results
 }
 
-// printResultsTable prints the per-level results table. When
-// networkBaselineGbit > 0 and unit is Gbit/s (i.e. this is an upload or
-// download table, not mkdir/list), it also prints an "Overhead vs iperf3"
-// column - this is the number that actually answers "does WebDAV add much
-// overhead", since it's compared against the raw-TCP ceiling rather than
-// just compared to itself at another concurrency level.
-func printResultsTable(out io.Writer, title string, unit string, results map[int]ConcurrencyLevelResult, concurrencyLevels []int, networkBaselineGbit float64) {
-	showOverhead := networkBaselineGbit > 0 && unit == "Gbit/s"
-
-	fmt.Fprintf(out, "\n=== %s (%s, median) ===\n", title, unit)
-	if showOverhead {
-		fmt.Fprintf(out, "%-10s%14s%22s\n", "Streams", "Result", "Overhead vs iperf3")
-	} else {
-		fmt.Fprintf(out, "%-10s%14s\n", "Streams", "Result")
+// padRightTo left-aligns s in a field of at least width chars.
+func padRightTo(s string, width int) string {
+	if len(s) >= width {
+		return s
 	}
+	return s + strings.Repeat(" ", width-len(s))
+}
 
+// overheadSuffix returns "  (12.3% overhead)" when a baseline is set, or ""
+// otherwise - appended directly onto the per-level result line so no
+// separate table is needed to see it.
+func overheadSuffix(medianGbit, networkBaselineGbit float64) string {
+	if networkBaselineGbit <= 0 {
+		return ""
+	}
+	overheadPercent := (networkBaselineGbit - medianGbit) / networkBaselineGbit * 100
+	return fmt.Sprintf("  (%.1f%% overhead)", overheadPercent)
+}
+
+// failureSuffix returns "  [N/total failed]" only when there were failures,
+// so clean runs stay on one short line instead of always showing "[0
+// failures across N runs]".
+func failureSuffix(failures, repeatsPerLevel int) string {
+	if failures == 0 {
+		return ""
+	}
+	return fmt.Sprintf("  [%d failed]", failures)
+}
+
+// printBestLine prints a single "Best: ..." line for a completed sweep,
+// plus a one-line caveat if any level showed WebDAV apparently beating the
+// iperf3 baseline (almost always iperf3 itself being CPU-bound at high
+// parallel-stream counts, not a real result).
+func printBestLine(out io.Writer, title, unit string, results map[int]ConcurrencyLevelResult, concurrencyLevels []int, networkBaselineGbit float64) {
+	if len(concurrencyLevels) == 0 {
+		return
+	}
 	best := results[concurrencyLevels[0]]
+	sawNegativeOverhead := false
 	for _, streams := range concurrencyLevels {
 		result := results[streams]
-		if showOverhead {
-			overheadPercent := (networkBaselineGbit - result.MedianResult) / networkBaselineGbit * 100
-			fmt.Fprintf(out, "%-10d%14.3f%21.1f%%\n", streams, result.MedianResult, overheadPercent)
-		} else {
-			fmt.Fprintf(out, "%-10d%14.3f\n", streams, result.MedianResult)
-		}
 		if result.MedianResult > best.MedianResult {
 			best = result
 		}
+		if networkBaselineGbit > 0 && unit == "Gbit/s" && result.MedianResult > networkBaselineGbit {
+			sawNegativeOverhead = true
+		}
 	}
-
-	fmt.Fprintf(out, "Best: %.3f %s at %d concurrent\n", best.MedianResult, unit, best.ConcurrentStreams)
-	if showOverhead {
-		bestOverheadPercent := (networkBaselineGbit - best.MedianResult) / networkBaselineGbit * 100
-		fmt.Fprintf(out, "At best concurrency, %s is %.1f%% below the %.3f Gbit/s iperf3 baseline\n",
-			strings.ToLower(title), bestOverheadPercent, networkBaselineGbit)
+	fmt.Fprintf(out, "%s best: %.3f %s at %d\n", title, best.MedianResult, unit, best.ConcurrentStreams)
+	if sawNegativeOverhead {
+		fmt.Fprintln(out, "  note: a level above showed higher throughput than the iperf3 baseline - that's")
+		fmt.Fprintln(out, "  iperf3 itself getting CPU-bound at high stream counts, not a real result; ignore it.")
 	}
 }
 
@@ -473,19 +493,19 @@ func main() {
 		}
 		switch strings.TrimSpace(op) {
 		case "upload":
-			results := runTransferBenchmark(ctx, client, out, "upload", randomFileData, *fileSizeMB, concurrencyLevels, *repeatsPerLevel, runTag)
-			printResultsTable(out, "UPLOAD", "Gbit/s", results, concurrencyLevels, *networkBaselineGbit)
+			results := runTransferBenchmark(ctx, client, out, "upload", randomFileData, *fileSizeMB, concurrencyLevels, *repeatsPerLevel, runTag, *networkBaselineGbit)
+			printBestLine(out, "Upload", "Gbit/s", results, concurrencyLevels, *networkBaselineGbit)
 		case "download":
-			results := runTransferBenchmark(ctx, client, out, "download", randomFileData, *fileSizeMB, concurrencyLevels, *repeatsPerLevel, runTag)
-			printResultsTable(out, "DOWNLOAD", "Gbit/s", results, concurrencyLevels, *networkBaselineGbit)
+			results := runTransferBenchmark(ctx, client, out, "download", randomFileData, *fileSizeMB, concurrencyLevels, *repeatsPerLevel, runTag, *networkBaselineGbit)
+			printBestLine(out, "Download", "Gbit/s", results, concurrencyLevels, *networkBaselineGbit)
 		case "mkdir":
 			results := runOperationBenchmark(ctx, client, out, "mkdir", concurrencyLevels, *repeatsPerLevel, runTag, client.CreateDirectory, true)
-			printResultsTable(out, "MKDIR (MKCOL)", "ops/s", results, concurrencyLevels, 0)
+			printBestLine(out, "Mkdir", "ops/s", results, concurrencyLevels, 0)
 		case "list":
 			results := runOperationBenchmark(ctx, client, out, "list", concurrencyLevels, *repeatsPerLevel, runTag, func(string) error {
 				return client.ListDirectory("")
 			}, false)
-			printResultsTable(out, "LIST (PROPFIND)", "ops/s", results, concurrencyLevels, 0)
+			printBestLine(out, "List", "ops/s", results, concurrencyLevels, 0)
 		default:
 			fmt.Fprintf(os.Stderr, "skipping unknown operation %q\n", op)
 		}

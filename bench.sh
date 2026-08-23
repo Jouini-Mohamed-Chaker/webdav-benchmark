@@ -1,13 +1,8 @@
 #!/bin/bash
-# bench.sh - baseline network throughput (iperf3) then WebDAV throughput,
-# with the iperf3 number automatically fed into webdav-benchmark so its
-# upload/download tables print an "overhead vs iperf3" column directly -
-# no manual cross-referencing of two separate outputs needed.
-#
-# -Z (zero-copy/sendfile) is used for the iperf3 baseline so the reported
-# number reflects the actual link ceiling rather than iperf3's own
-# userspace-copy CPU cost at higher parallel-stream counts, which was
-# causing WebDAV to appear to exceed the "baseline" on fast/direct paths.
+# bench.sh - build webdav-benchmark, then baseline network throughput
+# (iperf3), then WebDAV throughput, with the iperf3 number automatically
+# fed into webdav-benchmark so its upload/download lines print an
+# "overhead vs iperf3" figure directly.
 #
 # Usage:
 #   ./bench.sh <target-host> <webdav-url> [size_mb] [repeats] [max_level]
@@ -30,7 +25,13 @@ MAX_LEVEL="${5:-32}"   # match iperf3 parallelism to the highest WebDAV
                         # WebDAV streams.
 
 echo "=================================================="
-echo " STEP 1/2: iperf3 baseline (raw network, $MAX_LEVEL parallel streams, zero-copy) -> $TARGET_HOST"
+echo " STEP 1/3: building webdav-benchmark"
+echo "=================================================="
+go build -o webdav-benchmark .
+
+echo
+echo "=================================================="
+echo " STEP 2/3: iperf3 baseline (raw network, $MAX_LEVEL parallel streams) -> $TARGET_HOST"
 echo "=================================================="
 echo "NOTE: the iperf3 server is started/managed by Ansible - if this fails,"
 echo "check 'systemctl status iperf3' on $TARGET_HOST."
@@ -50,6 +51,6 @@ print(data["end"]["sum_received"]["bits_per_second"] / 1e9)
 
 echo
 echo "=================================================="
-echo " STEP 2/2: WebDAV benchmark -> $WEBDAV_URL"
+echo " STEP 3/3: WebDAV benchmark -> $WEBDAV_URL"
 echo "=================================================="
 ./webdav-benchmark -url "$WEBDAV_URL" -size "$SIZE_MB" -repeats "$REPEATS" -baseline-gbit "$BASELINE_GBIT"
