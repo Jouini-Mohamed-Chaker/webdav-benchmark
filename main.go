@@ -27,7 +27,7 @@ import (
 )
 
 // defaultConcurrencyLevels is the sweep used when -levels isn't given.
-var defaultConcurrencyLevels = []int{2, 4, 8, 16, 32, 48, 64}
+var defaultConcurrencyLevels = []int{2, 4, 8, 16, 32}
 
 func printErrorAndExit(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "ERROR: "+format+"\n", args...)
