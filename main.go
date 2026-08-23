@@ -27,7 +27,7 @@ import (
 )
 
 // defaultConcurrencyLevels is the sweep used when -levels isn't given.
-var defaultConcurrencyLevels = []int{2, 4, 8, 16, 32}
+var defaultConcurrencyLevels = []int{2, 4, 8, 16, 32, 48, 64}
 
 func printErrorAndExit(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "ERROR: "+format+"\n", args...)
@@ -343,19 +343,42 @@ func runOperationBenchmark(client *WebDAVClient, out io.Writer, operationName st
 	return results
 }
 
-func printResultsTable(out io.Writer, title string, unit string, results map[int]ConcurrencyLevelResult, concurrencyLevels []int) {
+// printResultsTable prints the per-level results table. When
+// networkBaselineGbit > 0 and unit is Gbit/s (i.e. this is an upload or
+// download table, not mkdir/list), it also prints an "Overhead vs iperf3"
+// column - this is the number that actually answers "does WebDAV add much
+// overhead", since it's compared against the raw-TCP ceiling rather than
+// just compared to itself at another concurrency level.
+func printResultsTable(out io.Writer, title string, unit string, results map[int]ConcurrencyLevelResult, concurrencyLevels []int, networkBaselineGbit float64) {
+	showOverhead := networkBaselineGbit > 0 && unit == "Gbit/s"
+
 	fmt.Fprintf(out, "\n=== %s (%s, median) ===\n", title, unit)
-	fmt.Fprintf(out, "%-10s%14s\n", "Streams", "Result")
+	if showOverhead {
+		fmt.Fprintf(out, "%-10s%14s%22s\n", "Streams", "Result", "Overhead vs iperf3")
+	} else {
+		fmt.Fprintf(out, "%-10s%14s\n", "Streams", "Result")
+	}
 
 	best := results[concurrencyLevels[0]]
 	for _, streams := range concurrencyLevels {
 		result := results[streams]
-		fmt.Fprintf(out, "%-10d%14.3f\n", streams, result.MedianResult)
+		if showOverhead {
+			overheadPercent := (networkBaselineGbit - result.MedianResult) / networkBaselineGbit * 100
+			fmt.Fprintf(out, "%-10d%14.3f%21.1f%%\n", streams, result.MedianResult, overheadPercent)
+		} else {
+			fmt.Fprintf(out, "%-10d%14.3f\n", streams, result.MedianResult)
+		}
 		if result.MedianResult > best.MedianResult {
 			best = result
 		}
 	}
+
 	fmt.Fprintf(out, "Best: %.3f %s at %d concurrent\n", best.MedianResult, unit, best.ConcurrentStreams)
+	if showOverhead {
+		bestOverheadPercent := (networkBaselineGbit - best.MedianResult) / networkBaselineGbit * 100
+		fmt.Fprintf(out, "At best concurrency, %s is %.1f%% below the %.3f Gbit/s iperf3 baseline\n",
+			strings.ToLower(title), bestOverheadPercent, networkBaselineGbit)
+	}
 }
 
 // =======================================================================
@@ -370,6 +393,7 @@ func main() {
 	operationsFlag := flag.String("ops", "upload,download,mkdir,list", "comma-separated operations to run: upload,download,mkdir,list")
 	requestTimeout := flag.Duration("timeout", 120*time.Second, "per-request HTTP timeout")
 	reportFilePath := flag.String("report", "", "path to write the plain-text report (default: results_<timestamp>.txt)")
+	networkBaselineGbit := flag.Float64("baseline-gbit", 0, "raw network throughput (Gbit/s) from iperf3, used to print an overhead-vs-network column on upload/download tables (0 = omit)")
 	flag.Parse()
 
 	if *webdavURL == "" {
@@ -395,8 +419,12 @@ func main() {
 		printErrorAndExit("cannot reach %s: %v", *webdavURL, err)
 	}
 
-	fmt.Fprintf(out, "Target: %s | size=%dMB | repeats=%d | levels=%v | ops=%v | started=%s\n\n",
+	fmt.Fprintf(out, "Target: %s | size=%dMB | repeats=%d | levels=%v | ops=%v | started=%s\n",
 		*webdavURL, *fileSizeMB, *repeatsPerLevel, concurrencyLevels, operations, time.Now().Format(time.RFC3339))
+	if *networkBaselineGbit > 0 {
+		fmt.Fprintf(out, "iperf3 network baseline: %.3f Gbit/s (upload/download tables below show overhead against this)\n", *networkBaselineGbit)
+	}
+	fmt.Fprintln(out)
 
 	randomFileData := make([]byte, *fileSizeMB<<20)
 	rand.Read(randomFileData)
@@ -405,18 +433,18 @@ func main() {
 		switch strings.TrimSpace(op) {
 		case "upload":
 			results := runTransferBenchmark(client, out, "upload", randomFileData, *fileSizeMB, concurrencyLevels, *repeatsPerLevel, runTag)
-			printResultsTable(out, "UPLOAD", "Gbit/s", results, concurrencyLevels)
+			printResultsTable(out, "UPLOAD", "Gbit/s", results, concurrencyLevels, *networkBaselineGbit)
 		case "download":
 			results := runTransferBenchmark(client, out, "download", randomFileData, *fileSizeMB, concurrencyLevels, *repeatsPerLevel, runTag)
-			printResultsTable(out, "DOWNLOAD", "Gbit/s", results, concurrencyLevels)
+			printResultsTable(out, "DOWNLOAD", "Gbit/s", results, concurrencyLevels, *networkBaselineGbit)
 		case "mkdir":
 			results := runOperationBenchmark(client, out, "mkdir", concurrencyLevels, *repeatsPerLevel, runTag, client.CreateDirectory, true)
-			printResultsTable(out, "MKDIR (MKCOL)", "ops/s", results, concurrencyLevels)
+			printResultsTable(out, "MKDIR (MKCOL)", "ops/s", results, concurrencyLevels, 0)
 		case "list":
 			results := runOperationBenchmark(client, out, "list", concurrencyLevels, *repeatsPerLevel, runTag, func(string) error {
 				return client.ListDirectory("")
 			}, false)
-			printResultsTable(out, "LIST (PROPFIND)", "ops/s", results, concurrencyLevels)
+			printResultsTable(out, "LIST (PROPFIND)", "ops/s", results, concurrencyLevels, 0)
 		default:
 			fmt.Fprintf(os.Stderr, "skipping unknown operation %q\n", op)
 		}
