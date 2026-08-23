@@ -13,21 +13,28 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 // defaultConcurrencyLevels is the sweep used when -levels isn't given.
-var defaultConcurrencyLevels = []int{2, 4, 8, 16, 32, 48, 64}
+// Capped at 32: higher levels (48/64) were observed to occasionally
+// saturate the backend's disk writeback and time out an entire run rather
+// than degrading gracefully - see README for details. Pass -levels
+// explicitly to go higher.
+var defaultConcurrencyLevels = []int{2, 4, 8, 16, 32}
 
 func printErrorAndExit(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "ERROR: "+format+"\n", args...)
@@ -249,6 +256,18 @@ func remoteNamesFor(runTag, operationName string, concurrentStreams, repeat int)
 	return names
 }
 
+// stoppedByUser reports whether ctx was cancelled (Ctrl+C / SIGTERM). Checked
+// between concurrency levels and between repeats so a sweep stops promptly
+// without leaving a half-run batch of requests in flight.
+func stoppedByUser(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
 // =======================================================================
 // Benchmarks
 // =======================================================================
@@ -256,7 +275,7 @@ func remoteNamesFor(runTag, operationName string, concurrentStreams, repeat int)
 // runTransferBenchmark sweeps upload or download throughput across
 // concurrency levels. For "download" it first uploads one shared source
 // file that every concurrent stream then downloads.
-func runTransferBenchmark(client *WebDAVClient, out io.Writer, direction string, fileData []byte, fileSizeMB int, concurrencyLevels []int, repeatsPerLevel int, runTag string) map[int]ConcurrencyLevelResult {
+func runTransferBenchmark(ctx context.Context, client *WebDAVClient, out io.Writer, direction string, fileData []byte, fileSizeMB int, concurrencyLevels []int, repeatsPerLevel int, runTag string) map[int]ConcurrencyLevelResult {
 	results := map[int]ConcurrencyLevelResult{}
 
 	sharedDownloadSource := runTag + "_download_source"
@@ -268,10 +287,16 @@ func runTransferBenchmark(client *WebDAVClient, out io.Writer, direction string,
 	}
 
 	for _, streams := range concurrencyLevels {
+		if stoppedByUser(ctx) {
+			break
+		}
 		var throughputSamples []float64
 		failures := 0
 
 		for repeat := 1; repeat <= repeatsPerLevel; repeat++ {
+			if stoppedByUser(ctx) {
+				break
+			}
 			fmt.Printf("\r%s: %d streams, run %d/%d...          ", direction, streams, repeat, repeatsPerLevel)
 			remoteNames := remoteNamesFor(runTag, direction, streams, repeat)
 
@@ -307,14 +332,20 @@ func runTransferBenchmark(client *WebDAVClient, out io.Writer, direction string,
 // across concurrency levels and reports operations-per-second. When
 // cleanupAfterEachRun is set, every remote name created during a run is
 // deleted afterwards (used for mkdir; list never creates anything).
-func runOperationBenchmark(client *WebDAVClient, out io.Writer, operationName string, concurrencyLevels []int, repeatsPerLevel int, runTag string, operation func(remoteName string) error, cleanupAfterEachRun bool) map[int]ConcurrencyLevelResult {
+func runOperationBenchmark(ctx context.Context, client *WebDAVClient, out io.Writer, operationName string, concurrencyLevels []int, repeatsPerLevel int, runTag string, operation func(remoteName string) error, cleanupAfterEachRun bool) map[int]ConcurrencyLevelResult {
 	results := map[int]ConcurrencyLevelResult{}
 
 	for _, streams := range concurrencyLevels {
+		if stoppedByUser(ctx) {
+			break
+		}
 		var opsPerSecondSamples []float64
 		failures := 0
 
 		for repeat := 1; repeat <= repeatsPerLevel; repeat++ {
+			if stoppedByUser(ctx) {
+				break
+			}
 			fmt.Printf("\r%s: %d concurrent, run %d/%d...          ", operationName, streams, repeat, repeatsPerLevel)
 			remoteNames := remoteNamesFor(runTag, operationName, streams, repeat)
 
@@ -415,6 +446,13 @@ func main() {
 	client := NewWebDAVClient(*webdavURL, *requestTimeout)
 	runTag := fmt.Sprintf("bench_%d", os.Getpid())
 
+	// Cancelled on Ctrl+C / SIGTERM. Checked between concurrency levels and
+	// between repeats so a run stops promptly - in-flight requests are
+	// allowed to finish, but no new batch is started - and the report file
+	// written so far is still valid and gets closed normally.
+	ctx, stopListening := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopListening()
+
 	if err := client.ListDirectory(""); err != nil {
 		printErrorAndExit("cannot reach %s: %v", *webdavURL, err)
 	}
@@ -430,18 +468,21 @@ func main() {
 	rand.Read(randomFileData)
 
 	for _, op := range operations {
+		if stoppedByUser(ctx) {
+			break
+		}
 		switch strings.TrimSpace(op) {
 		case "upload":
-			results := runTransferBenchmark(client, out, "upload", randomFileData, *fileSizeMB, concurrencyLevels, *repeatsPerLevel, runTag)
+			results := runTransferBenchmark(ctx, client, out, "upload", randomFileData, *fileSizeMB, concurrencyLevels, *repeatsPerLevel, runTag)
 			printResultsTable(out, "UPLOAD", "Gbit/s", results, concurrencyLevels, *networkBaselineGbit)
 		case "download":
-			results := runTransferBenchmark(client, out, "download", randomFileData, *fileSizeMB, concurrencyLevels, *repeatsPerLevel, runTag)
+			results := runTransferBenchmark(ctx, client, out, "download", randomFileData, *fileSizeMB, concurrencyLevels, *repeatsPerLevel, runTag)
 			printResultsTable(out, "DOWNLOAD", "Gbit/s", results, concurrencyLevels, *networkBaselineGbit)
 		case "mkdir":
-			results := runOperationBenchmark(client, out, "mkdir", concurrencyLevels, *repeatsPerLevel, runTag, client.CreateDirectory, true)
+			results := runOperationBenchmark(ctx, client, out, "mkdir", concurrencyLevels, *repeatsPerLevel, runTag, client.CreateDirectory, true)
 			printResultsTable(out, "MKDIR (MKCOL)", "ops/s", results, concurrencyLevels, 0)
 		case "list":
-			results := runOperationBenchmark(client, out, "list", concurrencyLevels, *repeatsPerLevel, runTag, func(string) error {
+			results := runOperationBenchmark(ctx, client, out, "list", concurrencyLevels, *repeatsPerLevel, runTag, func(string) error {
 				return client.ListDirectory("")
 			}, false)
 			printResultsTable(out, "LIST (PROPFIND)", "ops/s", results, concurrencyLevels, 0)
@@ -450,6 +491,10 @@ func main() {
 		}
 	}
 
+	if stoppedByUser(ctx) {
+		fmt.Printf("\nInterrupted - partial report written to %s\n", *reportFilePath)
+		return
+	}
 	fmt.Printf("\nFull report written to %s\n", *reportFilePath)
 }
 
